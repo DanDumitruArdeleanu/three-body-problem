@@ -575,6 +575,39 @@ def main():
         plt.savefig(os.path.join(outdir, "energy_drift.png"), dpi=150)
         plt.close()
 
+    if z_next is not None:
+        with torch.no_grad():
+            # one RK4 step from z
+            z_pred1 = rk4_step(model.time_derivatives, z, args.dt)
+
+        # reshape to [N, n_bodies, 6] and grab positions (x,y)
+        nB = args.n_bodies
+        q_true = z_next.view(-1, nB, 6)[..., :3].detach().cpu().numpy()
+        q_pred = z_pred1.view(-1, nB, 6)[..., :3].detach().cpu().numpy()
+
+        # quick scalar metric: RMSE@1 over the full state (q & p)
+        rmse1 = np.sqrt(((z_pred1.detach().cpu().numpy() - z_next.detach().cpu().numpy())**2).mean())
+        print(f"[train] RMSE@1 = {rmse1:.3e}")
+
+        # make a few overlay plots
+        use_N = min(8, q_true.shape[0])  # how many samples to visualize
+        for i in range(use_N):
+            plt.figure(figsize=(6, 6))
+            for b in range(nB):
+                # TRUE next-step (solid dot)
+                plt.scatter(q_true[i, b, 0], q_true[i, b, 1], s=20, label="true" if b == 0 else None)
+                # PRED next-step (X marker)
+                plt.scatter(q_pred[i, b, 0], q_pred[i, b, 1], s=32, marker="x", label="pred" if b == 0 else None)
+            plt.title(f"1-step target vs pred — sample {i}")
+            plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal"); plt.legend(frameon=False)
+            plt.tight_layout()
+            plt.savefig(os.path.join(_ensure_plots_dir("plots"), f"train_1step_overlay_sample{i:02d}.png"), dpi=150)
+            plt.close()
+
+        print(f"Saved 1-step overlay plots to: {_ensure_plots_dir("plots")}")
+    else:
+        print("[train] No z_next available — cannot make 1-step overlay plots.")
+
     # Eval rollout + diagnostics
     test_used = False
     if args.test_json and os.path.exists(args.test_json):
