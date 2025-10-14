@@ -373,7 +373,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=420)
     # Eval
     parser.add_argument("--rollout-steps", type=int, default=1000)
     # IO
@@ -604,7 +604,6 @@ def main():
             plt.savefig(os.path.join(_ensure_plots_dir("plots"), f"train_1step_overlay_sample{i:02d}.png"), dpi=150)
             plt.close()
 
-        print(f"Saved 1-step overlay plots to: {_ensure_plots_dir("plots")}")
     else:
         print("[train] No z_next available — cannot make 1-step overlay plots.")
 
