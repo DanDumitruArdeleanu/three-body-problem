@@ -41,22 +41,14 @@ def _to_tensor(x):
     return torch.from_numpy(arr).float()
 
 def load_json_data(path: str):
-    """
-    Load training/eval data from a JSON file.
-    Accepts these keys (any subset):
-      - "z":      [N, D] states            (alias: "X")
-      - "dz":     [N, D] time-derivatives  (alias: "Y")
-      - "z_next": [N, D] next state at dt  (alias: "y")
-      - "z0":     [B, D] initial states for evaluation
-      - "dt":     float timestep
-    Unknown keys are ignored.
-    """
     with open(path, 'r') as f:
         data = json.load(f)
     out = {}
     # Accept aliases X->z, Y->dz, y->z_next
     if 'z' in data or 'X' in data:
         out['z'] = _to_tensor(data.get('z', data.get('X')))
+    if 'X' in data:                                # <-- add this
+        out['X'] = _to_tensor(data['X'])           # <-- add this
     if 'dz' in data or 'Y' in data:
         out['dz'] = _to_tensor(data.get('dz', data.get('Y')))
     if 'z_next' in data or 'y' in data:
@@ -375,7 +367,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=420)
     # Eval
-    parser.add_argument("--rollout-steps", type=int, default=1000)
+    parser.add_argument("--rollout-steps", type=int, default=200)
     # IO
     parser.add_argument("--save", type=str, default="./hnn.pt")
     parser.add_argument("--load", type=str, default=None)
@@ -575,96 +567,156 @@ def main():
         plt.savefig(os.path.join(outdir, "energy_drift.png"), dpi=150)
         plt.close()
 
-    if z_next is not None:
-        with torch.no_grad():
-            # one RK4 step from z
-            z_pred1 = rk4_step(model.time_derivatives, z, args.dt)
-
-        # reshape to [N, n_bodies, 6] and grab positions (x,y)
-        nB = args.n_bodies
-        q_true = z_next.view(-1, nB, 6)[..., :3].detach().cpu().numpy()
-        q_pred = z_pred1.view(-1, nB, 6)[..., :3].detach().cpu().numpy()
-
-        # quick scalar metric: RMSE@1 over the full state (q & p)
-        rmse1 = np.sqrt(((z_pred1.detach().cpu().numpy() - z_next.detach().cpu().numpy())**2).mean())
-        print(f"[train] RMSE@1 = {rmse1:.3e}")
-
-        # make a few overlay plots
-        use_N = min(8, q_true.shape[0])  # how many samples to visualize
-        for i in range(use_N):
-            plt.figure(figsize=(6, 6))
-            for b in range(nB):
-                # TRUE next-step (solid dot)
-                plt.scatter(q_true[i, b, 0], q_true[i, b, 1], s=20, label="true" if b == 0 else None)
-                # PRED next-step (X marker)
-                plt.scatter(q_pred[i, b, 0], q_pred[i, b, 1], s=32, marker="x", label="pred" if b == 0 else None)
-            plt.title(f"1-step target vs pred — sample {i}")
-            plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal"); plt.legend(frameon=False)
-            plt.tight_layout()
-            plt.savefig(os.path.join(_ensure_plots_dir("plots"), f"train_1step_overlay_sample{i:02d}.png"), dpi=150)
-            plt.close()
-
-    else:
-        print("[train] No z_next available — cannot make 1-step overlay plots.")
-
     # Eval rollout + diagnostics
     test_used = False
+
+    def _try_get_tensor(jd, key, device, dtype):
+        if key in jd and jd[key] is not None:
+            t = jd[key]
+            if not torch.is_tensor(t):
+                t = torch.as_tensor(t, device=device, dtype=dtype)
+            else:
+                t = t.to(device).to(dtype)
+            return t
+        return None
+
+    def _overlay_true_pred_plots(jd, traj_pred, n_bodies, outdir, device, dtype):
+        """
+        Try to find a ground-truth multi-step trajectory in jd, align lengths,
+        and save true-vs-pred overlays (per body + all bodies).
+        """
+        # Prefer explicit keys, but fall back to X if it looks like [T, B, D] or [T, D]
+        traj_true = _try_get_tensor(jd, "traj_true", device, dtype)
+        if traj_true is None:
+            traj_true = _try_get_tensor(jd, "traj", device, dtype)
+
+        if traj_true is None:
+            X = _try_get_tensor(jd, "X", device, dtype)
+            if X is not None and X.ndim >= 2:
+                # Heuristic: treat X with 3 dims as [T,B,D] or [T,1,D] (true traj)
+                # Treat [T,D] also as a single-trajectory truth
+                if X.ndim == 3 and X.shape[-1] == 6 * n_bodies:
+                    traj_true = X  # [T, B, D]
+                elif X.ndim == 2 and X.shape[-1] == 6 * n_bodies:
+                    traj_true = X.unsqueeze(1)  # [T, 1, D]
+
+        if traj_true is None:
+            print("No ground-truth multi-step trajectory ('traj_true'/'traj' or 3D 'X') in test JSON; "
+                "skipping true vs predicted overlays.")
+            return
+
+        # Align lengths
+        T_cmp = min(traj_pred.shape[0], traj_true.shape[0])
+        traj_pred_cmp = traj_pred[:T_cmp]
+        traj_true_cmp = traj_true[:T_cmp]
+
+        # Extract positions as [T, B, n_bodies, 3]
+        def _to_q(t):  # [T,B,D] with D=6*n_bodies, q then p
+            q = t[..., :3 * n_bodies]
+            return q.reshape(T_cmp, -1, n_bodies, 3)
+
+        q_pred = _to_q(traj_pred_cmp).detach().cpu().numpy()
+        q_true = _to_q(traj_true_cmp).detach().cpu().numpy()
+
+        # Pick a single trajectory index for clarity (first in batch)
+        bidx = 0
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+
+        # Per-body overlays
+        for b in range(n_bodies):
+            plt.figure(figsize=(6, 6))
+            plt.plot(q_true[:, bidx, b, 0], q_true[:, bidx, b, 1], '-',  alpha=0.85, label='true')
+            plt.plot(q_pred[:, bidx, b, 0], q_pred[:, bidx, b, 1], '--', alpha=0.9,  label='pred')
+            plt.title(f"Body {b} — True vs Predicted (x–y)")
+            plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal")
+            plt.grid(True, alpha=0.3); plt.legend(frameon=False)
+            plt.tight_layout()
+            plt.savefig(os.path.join(outdir, f"true_vs_pred_body{b}_xy.png"), dpi=150)
+            plt.close()
+
+        # All bodies together
+        plt.figure(figsize=(6, 6))
+        for b in range(n_bodies):
+            plt.plot(q_true[:, bidx, b, 0], q_true[:, bidx, b, 1], '-',  alpha=0.65, label=f"true b{b}")
+            plt.plot(q_pred[:, bidx, b, 0], q_pred[:, bidx, b, 1], '--', alpha=0.85, label=f"pred b{b}")
+        plt.title("All bodies — True vs Predicted (x–y)")
+        plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal")
+        plt.grid(True, alpha=0.3); plt.legend(frameon=False, ncol=2)
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "true_vs_pred_allbodies_xy.png"), dpi=150)
+        plt.close()
+
+        # Optional: error curve (RMSE over time)
+        err = (traj_pred_cmp - traj_true_cmp).detach().cpu().numpy()
+        rmse_t = np.sqrt((err**2).mean(axis=(1, 2)))
+        plt.figure(figsize=(7, 4))
+        plt.plot(rmse_t)
+        plt.xlabel("time step"); plt.ylabel("RMSE")
+        plt.title(f"Trajectory RMSE over time (first {T_cmp} steps)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "true_vs_pred_rmse_t.png"), dpi=150)
+        plt.close()
+
+        print("Saved true vs predicted trajectory overlays to ./plots/")
+
     if args.test_json and os.path.exists(args.test_json):
         jd = load_json_data(args.test_json)
-        z0 = jd.get("z0", jd.get("z", None))
+
+        # Try to get z0 from test JSON. If we detect a 3D X as traj_true, we'll reset z0 below.
+        z0 = _try_get_tensor(jd, "z0", args.device, torch.float32)
+        if z0 is None:
+            X_any = _try_get_tensor(jd, "X", args.device, torch.float32)
+            if X_any is not None:
+                if X_any.ndim == 2:
+                    z0 = X_any  # [B, D]
+                elif X_any.ndim == 3 and X_any.shape[-1] == 6 * args.n_bodies:
+                    # Treat X as a true trajectory; use its first frame as z0
+                    z0 = X_any[0]  # [B, D]
+                    jd["_X_was_traj_true"] = True  # mark for info message
+
         if z0 is not None:
-            z0 = z0.to(args.device)
-            if "dt" in jd: args.dt = jd["dt"]
-            traj = rollout(rk4_step, model.time_derivatives, z0, steps=args.rollout_steps, dt=args.dt)
+            if "dt" in jd: args.dt = float(jd["dt"])
+
+            # If we discovered that X is a trajectory, roll out to its length-1 for fair comparison.
+            steps = args.rollout_steps
+            if jd.get("_X_was_traj_true", False):
+                steps = int(_try_get_tensor(jd, "X", args.device, torch.float32).shape[0]) - 1
+
+            traj = rollout(rk4_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
             drift = rel_energy_drift(model, traj)
 
-            # keep a short, informative print (no giant arrays)
             mean6 = drift[:6].mean(1).cpu().numpy()
             print(f"Eval(JSON): traj={tuple(traj.shape)}  mean relE first 6 steps={mean6}")
 
-            # New plots
             outdir = _ensure_plots_dir("plots")
+
+            # Diagnostic plots (pred only)
             q = _traj_to_q(traj, args.n_bodies)
-
-            # 1) Per-body overlay of many trajectories (x–y)
             plot_xy_all_bodies(q, outdir, max_trajs=16)
-
-            # 2) Per-trajectory plot showing all bodies together (x–y)
             plot_xy_per_traj(q, outdir, bodies="all", max_trajs=8)
-
-            # 3) Per-body 3D plots (first few trajectories)
             plot_3d_each_body(q, outdir, max_trajs=4)
-
-            # 4) Energy drift curve (mean±std across trajectories)
             plot_energy_drift(drift, outdir)
+
+            # NEW: try to overlay with ground truth if available or if X looked like [T,B,D]
+            _overlay_true_pred_plots(jd, traj, args.n_bodies, outdir, args.device, traj.dtype)
 
             print(f"Saved plots to: {outdir}")
             test_used = True
+
     if not test_used and args.val_z0 is not None and os.path.exists(args.val_z0):
         z0 = load_npy(args.val_z0).to(args.device)
         traj = rollout(rk4_step, model.time_derivatives, z0, steps=args.rollout_steps, dt=args.dt)
         drift = rel_energy_drift(model, traj)
 
-        # keep a short, informative print (no giant arrays)
         mean6 = drift[:6].mean(1).cpu().numpy()
-        print(f"Eval(JSON): traj={tuple(traj.shape)}  mean relE first 6 steps={mean6}")
+        print(f"Eval: traj={tuple(traj.shape)}  mean relE first 6 steps={mean6}")
 
-        # New plots
         outdir = _ensure_plots_dir("plots")
         q = _traj_to_q(traj, args.n_bodies)
-
-        # 1) Per-body overlay of many trajectories (x–y)
         plot_xy_all_bodies(q, outdir, max_trajs=16)
-
-        # 2) Per-trajectory plot showing all bodies together (x–y)
         plot_xy_per_traj(q, outdir, bodies="all", max_trajs=8)
-
-        # 3) Per-body 3D plots (first few trajectories)
         plot_3d_each_body(q, outdir, max_trajs=4)
-
-        # 4) Energy drift curve (mean±std across trajectories)
         plot_energy_drift(drift, outdir)
-
         print(f"Saved plots to: {outdir}")
 
 if __name__ == "__main__":
