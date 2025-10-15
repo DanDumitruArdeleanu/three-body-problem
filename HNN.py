@@ -7,6 +7,8 @@ from torch import nn
 from torch.nn import functional as F
 import random
 import json
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 import os
@@ -646,7 +648,7 @@ def main():
         plt.savefig(os.path.join(outdir, "true_vs_pred_allbodies_xy.png"), dpi=150)
         plt.close()
 
-        # Optional: error curve (RMSE over time)
+        # error curve (RMSE over time)
         err = (traj_pred_cmp - traj_true_cmp).detach().cpu().numpy()
         rmse_t = np.sqrt((err**2).mean(axis=(1, 2)))
         plt.figure(figsize=(7, 4))
@@ -697,7 +699,7 @@ def main():
             plot_3d_each_body(q, outdir, max_trajs=4)
             plot_energy_drift(drift, outdir)
 
-            # NEW: try to overlay with ground truth if available or if X looked like [T,B,D]
+            # try to overlay with ground truth if available or if X looked like [T,B,D]
             _overlay_true_pred_plots(jd, traj, args.n_bodies, outdir, args.device, traj.dtype)
 
             print(f"Saved plots to: {outdir}")
