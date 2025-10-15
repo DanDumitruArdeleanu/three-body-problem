@@ -12,9 +12,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 import os
+import csv
 
 # Utilities
-def seed_all(seed=0):
+def seed_all(seed=420):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
 
@@ -275,6 +276,25 @@ def energy_loss(model: HNN, z: torch.Tensor, H_true: torch.Tensor) -> torch.Tens
     # supervised scalar energy when ground-truth H is known (toy systems).
     return F.mse_loss(model.hamiltonian(z), H_true)
 
+def leapfrog_step(dzdt, z, dt):
+    ndof = z.shape[1] // 2
+    q, p = z[:, :ndof], z[:, ndof:]
+    # half kick
+    dpdt = dzdt(z)[:, ndof:]
+    p_half = p + 0.5 * dt * dpdt
+    # drift
+    z_half = torch.cat([q, p_half], dim=1)
+    dqdt = dzdt(z_half)[:, :ndof]
+    q_new = q + dt * dqdt
+    # full kick
+    z_new_half = torch.cat([q_new, p_half], dim=1)
+    dpdt_new = dzdt(z_new_half)[:, ndof:]
+    p_new = p_half + 0.5 * dt * dpdt_new
+    return torch.cat([q_new, p_new], dim=1)
+
+def get_stepper(name):
+    return rk4_step if name == "rk4" else leapfrog_step
+
 # Diagnostics
 @torch.no_grad()
 def rel_energy_drift(model: HNN, traj: torch.Tensor) -> torch.Tensor:
@@ -312,6 +332,15 @@ def constrain_pair_distance(i: int, j: int, dist: float) -> Callable[[torch.Tens
         rij = q_bN3[:, i] - q_bN3[:, j]
         return (rij.pow(2).sum(-1).sqrt() - dist).unsqueeze(1)  # [B,1]
     return g
+
+def _append_csv(path, **kw):
+    Path(os.path.dirname(path) or ".").mkdir(parents=True, exist_ok=True)
+    import csv
+    new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(kw.keys()))
+        if new: w.writeheader()
+        w.writerow(kw)
 
 # Checkpoint IO
 def save_checkpoint(path, model):
@@ -374,6 +403,12 @@ def main():
     parser.add_argument("--save", type=str, default="./hnn.pt")
     parser.add_argument("--load", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
+    # CLI
+    parser.add_argument("--plot-batch-index", type=int, default=0, help="Which batch traj to visualize in overlays")
+    parser.add_argument("--integrator", type=str, default="rk4", choices=["rk4","leapfrog"], help="Integrator used for rollouts at eval")
+    parser.add_argument("--rollout-K", type=int, default=0, help="If >0, also train a short-horizon K-step objective (in addition to 1-step)")
+    parser.add_argument("--metrics-csv", type=str, default="plots/metrics.csv", help="Path to write epoch/test metrics CSV")
+
     args = parser.parse_args()
 
     seed_all(args.seed)
@@ -448,25 +483,57 @@ def main():
         print(f"Loading checkpoint: {args.load}")
         load_checkpoint(args.load, model, map_location=args.device)
 
-    # Train
-    if args.mode == "vfield":
-        if dz is None:
-            if args.train_dz is None:
-                raise SystemExit("--train-dz is required in vfield mode (or provide dz in HNN_train.json)")
-            dz = load_npy(args.train_dz).to(args.device)
-        assert dz.shape == z.shape
-        for ep in range(1, args.epochs+1):
-            loss = train_epoch_vfield(model, z, dz, batch_size=args.batch, lr=args.lr)
-            print(f"[vf] epoch {ep:03d} | loss {loss:.6f}")
-    else:
-        if z_next is None:
-            if args.train_z_next is None:
-                raise SystemExit("--train-z-next is required in rollout mode (or provide z_next in HNN_train.json)")
-            z_next = load_npy(args.train_z_next).to(args.device)
-        assert z_next.shape == z.shape
-        for ep in range(1, args.epochs+1):
+    # Training diagnostics (RSME curves & metrics CSV)
+    metrics_csv = "plots/metrics.csv"
+    os.makedirs("plots", exist_ok=True)
+
+    train_rmse_hist, val_rmse_hist = [], []
+    epochs = args.epochs
+
+    for ep in range(1, epochs+1):
+        if args.mode == "rollout":
             loss = train_epoch_rollout(model, z, z_next, args.dt, batch_size=args.batch, lr=args.lr)
-            print(f"[ro] epoch {ep:03d} | loss {loss:.6f}")
+            with torch.no_grad():
+                z_pred = rk4_step(model.time_derivatives, z, args.dt)
+                rmse_train = torch.sqrt(F.mse_loss(z_pred, z_next)).item()
+        else:
+            loss = train_epoch_vfield(model, z, dz, batch_size=args.batch, lr=args.lr)
+            with torch.no_grad():
+                pred_dz = model.time_derivatives(z)
+                rmse_train = torch.sqrt(F.mse_loss(pred_dz, dz)).item()
+
+        # Optional validation RMSE
+        rmse_val = None
+        if args.test_json and os.path.exists(args.test_json):
+            jd_val = load_json_data(args.test_json)
+            z_val = jd_val.get("z"); z_next_val = jd_val.get("z_next")
+            if z_val is not None and z_next_val is not None:
+                z_val = z_val.to(args.device); z_next_val = z_next_val.to(args.device)
+                with torch.no_grad():
+                    z_pred_val = rk4_step(model.time_derivatives, z_val, args.dt)
+                    rmse_val = torch.sqrt(F.mse_loss(z_pred_val, z_next_val)).item()
+
+        train_rmse_hist.append(rmse_train)
+        val_rmse_hist.append(rmse_val if rmse_val is not None else float('nan'))
+
+        print(f"[{args.mode}] epoch {ep:03d} | loss {loss:.6e} | RMSE_train {rmse_train:.6e}"
+            + (f" | RMSE_val {rmse_val:.6e}" if rmse_val else ""))
+
+        with open(metrics_csv, "a", newline="") as f:
+            writer = csv.writer(f)
+            if ep == 1:
+                writer.writerow(["epoch", "loss", "rmse_train", "rmse_val"])
+            writer.writerow([ep, loss, rmse_train, rmse_val])
+
+    # Plot RMSE vs Epoch
+    plt.figure(figsize=(6,4))
+    plt.plot(range(1, epochs+1), train_rmse_hist, label="Train RMSE")
+    if any(not np.isnan(v) for v in val_rmse_hist):
+        plt.plot(range(1, epochs+1), val_rmse_hist, label="Val RMSE")
+    plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("RMSE vs Epochs")
+    plt.grid(alpha=0.3); plt.legend(frameon=False); plt.tight_layout()
+    plt.savefig("plots/rmse_epochs.png", dpi=150); plt.close()
+    print("Saved training curves to plots/rmse_epochs.png")
 
     # Save
     os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
@@ -488,65 +555,6 @@ def main():
         q = traj[..., :3*n_bodies]                 # [T, B, 3*n_bodies]
         q = q.reshape(T, B, n_bodies, 3)           # [T, B, n_bodies, 3]
         return q
-
-    def plot_xy_all_bodies(q, outdir, max_trajs=16):
-        """
-        q: [T, B, n_bodies, 3]
-        Saves: one plot per body overlaying up to max_trajs trajectories (x-y).
-        """
-        T, B, n_bodies, _ = q.shape
-        use_B = min(B, max_trajs)
-
-        for b in range(n_bodies):
-            plt.figure(figsize=(6, 6))
-            for i in range(use_B):
-                plt.plot(q[:, i, b, 0], q[:, i, b, 1], linewidth=0.8)
-            plt.title(f"Trajectories (x–y) — Body {b} (first {use_B} trajs)")
-            plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal"); plt.tight_layout()
-            plt.savefig(os.path.join(outdir, f"traj_body{b}_xy_all.png"), dpi=150)
-            plt.close()
-
-    def plot_xy_per_traj(q, outdir, bodies="all", max_trajs=8):
-        """
-        q: [T, B, n_bodies, 3]
-        Saves: per-trajectory plots with all bodies together (x–y).
-        """
-        T, B, n_bodies, _ = q.shape
-        use_B = min(B, max_trajs)
-        if bodies == "all":
-            bodies_idx = range(n_bodies)
-        else:
-            bodies_idx = bodies
-
-        for i in range(use_B):
-            plt.figure(figsize=(6, 6))
-            for b in bodies_idx:
-                plt.plot(q[:, i, b, 0], q[:, i, b, 1], linewidth=0.9, label=f"body {b}")
-            plt.title(f"Traj {i} — all bodies (x–y)")
-            plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal"); plt.legend(frameon=False)
-            plt.tight_layout()
-            plt.savefig(os.path.join(outdir, f"traj{i:02d}_allbodies_xy.png"), dpi=150)
-            plt.close()
-
-    def plot_3d_each_body(q, outdir, max_trajs=4):
-        """
-        q: [T, B, n_bodies, 3]
-        Saves: per-body 3D plots (first max_trajs trajectories).
-        """
-        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401, import registers 3D
-        T, B, n_bodies, _ = q.shape
-        use_B = min(B, max_trajs)
-
-        for b in range(n_bodies):
-            fig = plt.figure(figsize=(6, 6))
-            ax = fig.add_subplot(111, projection="3d")
-            for i in range(use_B):
-                ax.plot(q[:, i, b, 0], q[:, i, b, 1], q[:, i, b, 2], linewidth=0.8)
-            ax.set_title(f"Body {b} — 3D trajectories (first {use_B})")
-            ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-            plt.tight_layout()
-            plt.savefig(os.path.join(outdir, f"traj_body{b}_3d.png"), dpi=150)
-            plt.close()
 
     def plot_energy_drift(drift_tensor, outdir):
         """
@@ -609,16 +617,18 @@ def main():
 
         # Align lengths
         T_cmp = min(traj_pred.shape[0], traj_true.shape[0])
-        traj_pred_cmp = traj_pred[:T_cmp]
+        traj_pred_cmp = traj_pred[:T_cmp].detach()  # <--- add .detach()
         traj_true_cmp = traj_true[:T_cmp]
+        if torch.is_tensor(traj_true_cmp) and traj_true_cmp.requires_grad:
+            traj_true_cmp = traj_true_cmp.detach()  # <--- optional, for safety
 
-        # Extract positions as [T, B, n_bodies, 3]
-        def _to_q(t):  # [T,B,D] with D=6*n_bodies, q then p
+        # Extract positions as [T,B,n_bodies,3]
+        def _to_q(t):  # [T,B,D] with D = 6*n_bodies, q then p
             q = t[..., :3 * n_bodies]
             return q.reshape(T_cmp, -1, n_bodies, 3)
 
-        q_pred = _to_q(traj_pred_cmp).detach().cpu().numpy()
-        q_true = _to_q(traj_true_cmp).detach().cpu().numpy()
+        q_pred = _to_q(traj_pred_cmp).cpu().numpy()
+        q_true = _to_q(traj_true_cmp).cpu().numpy() if torch.is_tensor(traj_true_cmp) else q_true
 
         # Pick a single trajectory index for clarity (first in batch)
         bidx = 0
@@ -683,8 +693,11 @@ def main():
             steps = args.rollout_steps
             if jd.get("_X_was_traj_true", False):
                 steps = int(_try_get_tensor(jd, "X", args.device, torch.float32).shape[0]) - 1
+            
+            with torch.no_grad():
+                traj = rollout(rk4_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
+            traj = traj.detach()
 
-            traj = rollout(rk4_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
             drift = rel_energy_drift(model, traj)
 
             mean6 = drift[:6].mean(1).cpu().numpy()
@@ -694,10 +707,104 @@ def main():
 
             # Diagnostic plots (pred only)
             q = _traj_to_q(traj, args.n_bodies)
-            plot_xy_all_bodies(q, outdir, max_trajs=16)
-            plot_xy_per_traj(q, outdir, bodies="all", max_trajs=8)
-            plot_3d_each_body(q, outdir, max_trajs=4)
             plot_energy_drift(drift, outdir)
+
+            # Additional evaluation diagnostics
+            # Compute energy, linear & angular momentum over time
+            with torch.no_grad():
+                Ht = torch.stack([model.hamiltonian(traj[t]) for t in range(traj.size(0))]).cpu().numpy()
+                P  = torch.stack([total_linear_momentum(traj[t]) for t in range(traj.size(0))]).cpu().numpy()
+                L  = torch.stack([angular_momentum(traj[t])       for t in range(traj.size(0))]).cpu().numpy()
+
+            Ht_mean = Ht.mean(axis=1)
+            P_mean  = P.mean(axis=1)
+            L_mean  = L.mean(axis=1)
+
+            # Energy vs time
+            plt.figure(figsize=(7,4))
+            plt.plot(Ht_mean, label="⟨H⟩")
+            plt.xlabel("step"); plt.ylabel("Energy"); plt.title("Energy vs Time")
+            plt.grid(alpha=0.3); plt.legend(frameon=False)
+            plt.tight_layout(); plt.savefig(os.path.join(outdir, "energy_time.png"), dpi=150); plt.close()
+
+            # Linear momentum components
+            plt.figure(figsize=(7,4))
+            for i, comp in enumerate(["x", "y", "z"]):
+                plt.plot(P_mean[:, i], label=f"P_{comp}")
+            plt.xlabel("step"); plt.ylabel("Momentum"); plt.title("Linear Momentum vs Time")
+            plt.grid(alpha=0.3); plt.legend(frameon=False)
+            plt.tight_layout(); plt.savefig(os.path.join(outdir, "linear_momentum_time.png"), dpi=150); plt.close()
+
+            # Angular momentum components
+            plt.figure(figsize=(7,4))
+            for i, comp in enumerate(["x", "y", "z"]):
+                plt.plot(L_mean[:, i], label=f"L_{comp}")
+            plt.xlabel("step"); plt.ylabel("Angular Momentum"); plt.title("Angular Momentum vs Time")
+            plt.grid(alpha=0.3); plt.legend(frameon=False)
+            plt.tight_layout(); plt.savefig(os.path.join(outdir, "angular_momentum_time.png"), dpi=150); plt.close()
+
+            # Per-body RMSE(t) if ground-truth trajectory available
+            traj_true = jd.get("traj_true") or jd.get("traj") or jd.get("X")
+            if traj_true is not None:
+                if not torch.is_tensor(traj_true):
+                    traj_true = torch.as_tensor(traj_true, device=traj.device, dtype=traj.dtype)
+
+                # If 2-D [T, D], treat as single-trajectory batch [T, 1, D]
+                if traj_true.ndim == 2:
+                    traj_true = traj_true.unsqueeze(1)
+                elif traj_true.ndim != 3:
+                    raise SystemExit(f"Expected traj_true with ndim 2 or 3, got {traj_true.ndim}")
+
+                T_cmp = min(traj.shape[0], traj_true.shape[0])
+                ndof = 3 * args.n_bodies
+
+                # Use ellipsis so both [T,B,D] and [T,1,D] work
+                q_pred = traj[:T_cmp, ..., :ndof].reshape(T_cmp, -1, args.n_bodies, 3).cpu().numpy()
+                q_true = traj_true[:T_cmp, ..., :ndof].reshape(T_cmp, -1, args.n_bodies, 3).cpu().numpy()
+
+                bidx = 0
+                for b in range(args.n_bodies):
+                    diff = q_pred[:, bidx, b] - q_true[:, bidx, b]
+                    rmse_t = np.sqrt((diff**2).mean(axis=1))
+                    plt.figure(figsize=(6,4))
+                    plt.plot(rmse_t)
+                    plt.xlabel("step"); plt.ylabel(f"RMSE body {b}")
+                    plt.title(f"Body {b} RMSE over time")
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(outdir, f"rmse_time_body{b}.png"), dpi=150)
+                    plt.close()
+
+            with torch.no_grad():
+                if hasattr(model, "log_m_body"):
+                    m = model.log_m_body.exp().cpu().numpy()
+                    plt.figure(figsize=(5,3))
+                    plt.bar(range(len(m)), m)
+                    plt.title("Learned Mass per Body")
+                    plt.xlabel("Body index"); plt.ylabel("Mass")
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(outdir, "learned_masses.png"), dpi=150); plt.close()
+                    print("Learned masses:", np.round(m, 4))
+
+            traj_rk4 = rollout(rk4_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
+            traj_lf  = rollout(leapfrog_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
+
+            Ht_rk4 = torch.stack([
+                model.hamiltonian(traj_rk4[t]).detach()
+                for t in range(traj_rk4.size(0))
+            ]).cpu().numpy().mean(1)
+
+            Ht_lf = torch.stack([
+                model.hamiltonian(traj_lf[t]).detach()
+                for t in range(traj_lf.size(0))
+            ]).cpu().numpy().mean(1)
+
+            plt.figure(figsize=(7,4))
+            plt.plot(Ht_rk4, label="RK4")
+            plt.plot(Ht_lf, label="Leapfrog")
+            plt.xlabel("step"); plt.ylabel("Energy")
+            plt.title("Energy Stability: RK4 vs Leapfrog")
+            plt.legend(frameon=False)
+            plt.tight_layout(); plt.savefig(os.path.join(outdir, "energy_rk4_vs_leapfrog.png"), dpi=150); plt.close()
 
             # try to overlay with ground truth if available or if X looked like [T,B,D]
             _overlay_true_pred_plots(jd, traj, args.n_bodies, outdir, args.device, traj.dtype)
@@ -715,10 +822,114 @@ def main():
 
         outdir = _ensure_plots_dir("plots")
         q = _traj_to_q(traj, args.n_bodies)
-        plot_xy_all_bodies(q, outdir, max_trajs=16)
-        plot_xy_per_traj(q, outdir, bodies="all", max_trajs=8)
-        plot_3d_each_body(q, outdir, max_trajs=4)
         plot_energy_drift(drift, outdir)
+
+        # Additional evaluation diagnostics
+        # Compute energy, linear & angular momentum over time
+        with torch.no_grad():
+            Ht = torch.stack([model.hamiltonian(traj[t]) for t in range(traj.size(0))]).cpu().numpy()
+            P  = torch.stack([total_linear_momentum(traj[t]) for t in range(traj.size(0))]).cpu().numpy()
+            L  = torch.stack([angular_momentum(traj[t])       for t in range(traj.size(0))]).cpu().numpy()
+
+        Ht_mean = Ht.mean(axis=1)
+        P_mean  = P.mean(axis=1)
+        L_mean  = L.mean(axis=1)
+
+        # Energy vs time
+        plt.figure(figsize=(7,4))
+        plt.plot(Ht_mean, label="⟨H⟩")
+        plt.xlabel("step"); plt.ylabel("Energy"); plt.title("Energy vs Time")
+        plt.grid(alpha=0.3); plt.legend(frameon=False)
+        plt.tight_layout(); plt.savefig(os.path.join(outdir, "energy_time.png"), dpi=150); plt.close()
+
+        # Linear momentum components
+        plt.figure(figsize=(7,4))
+        for i, comp in enumerate(["x", "y", "z"]):
+            plt.plot(P_mean[:, i], label=f"P_{comp}")
+        plt.xlabel("step"); plt.ylabel("Momentum"); plt.title("Linear Momentum vs Time")
+        plt.grid(alpha=0.3); plt.legend(frameon=False)
+        plt.tight_layout(); plt.savefig(os.path.join(outdir, "linear_momentum_time.png"), dpi=150); plt.close()
+
+        # Angular momentum components
+        plt.figure(figsize=(7,4))
+        for i, comp in enumerate(["x", "y", "z"]):
+            plt.plot(L_mean[:, i], label=f"L_{comp}")
+        plt.xlabel("step"); plt.ylabel("Angular Momentum"); plt.title("Angular Momentum vs Time")
+        plt.grid(alpha=0.3); plt.legend(frameon=False)
+        plt.tight_layout(); plt.savefig(os.path.join(outdir, "angular_momentum_time.png"), dpi=150); plt.close()
+
+        # Per-body RMSE(t) if ground-truth trajectory available
+        traj_true_raw = jd.get("traj_true") or jd.get("traj") or jd.get("X")
+        if traj_true_raw is not None:
+            traj_true = torch.as_tensor(traj_true_raw, device=traj.device, dtype=traj.dtype)
+
+            # Accept [T, D] or [T, B, D]. If it's 2-D, treat as single-trajectory batch.
+            if traj_true.ndim == 2:           # [T, D] → [T, 1, D]
+                traj_true = traj_true.unsqueeze(1)
+            elif traj_true.ndim != 3:
+                raise SystemExit(f"Expected traj_true with ndim 2 or 3, got {traj_true.ndim}")
+
+            # Sanity: last dim must match model’s D
+            if traj_true.shape[-1] != traj.shape[-1]:
+                raise SystemExit(f"traj_true D={traj_true.shape[-1]} != model D={traj.shape[-1]}")
+
+            # Align + detach
+            T_cmp = min(traj.shape[0], traj_true.shape[0])
+            traj_pred_cmp = traj[:T_cmp].detach()
+            traj_true_cmp = traj_true[:T_cmp].detach()
+
+            # Extract positions [T, B, n_bodies, 3] using ellipsis (works for both cases)
+            ndof = 3 * args.n_bodies
+            q_pred = traj_pred_cmp[..., :ndof].reshape(T_cmp, -1, args.n_bodies, 3).cpu().numpy()
+            q_true = traj_true_cmp[..., :ndof].reshape(T_cmp, -1, args.n_bodies, 3).cpu().numpy()
+
+            bidx = 0  # or use args.plot_batch_index if you added it
+            for b in range(args.n_bodies):
+                diff = q_pred[:, bidx, b] - q_true[:, bidx, b]  # [T_cmp, 3]
+                rmse_t = np.sqrt((diff**2).mean(axis=1))
+                plt.figure(figsize=(6,4))
+                plt.plot(rmse_t)
+                plt.xlabel("step"); plt.ylabel(f"RMSE body {b}")
+                plt.title(f"Body {b} RMSE over time")
+                plt.tight_layout()
+                plt.savefig(os.path.join(outdir, f"rmse_time_body{b}.png"), dpi=150)
+                plt.close()
+        
+        else:
+            print("No ground-truth multi-step trajectory; skipping overlays.")
+
+        with torch.no_grad():
+            if hasattr(model, "log_m_body"):
+                m = model.log_m_body.exp().cpu().numpy()
+                plt.figure(figsize=(5,3))
+                plt.bar(range(len(m)), m)
+                plt.title("Learned Mass per Body")
+                plt.xlabel("Body index"); plt.ylabel("Mass")
+                plt.tight_layout()
+                plt.savefig(os.path.join(outdir, "learned_masses.png"), dpi=150); plt.close()
+                print("Learned masses:", np.round(m, 4))
+
+        traj_rk4 = rollout(rk4_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
+        traj_lf  = rollout(leapfrog_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
+
+        Ht_rk4 = torch.stack([
+            model.hamiltonian(traj_rk4[t]).detach()
+            for t in range(traj_rk4.size(0))
+        ]).cpu().numpy().mean(1)
+
+        Ht_lf = torch.stack([
+            model.hamiltonian(traj_lf[t]).detach()
+            for t in range(traj_lf.size(0))
+        ]).cpu().numpy().mean(1)
+
+        plt.figure(figsize=(7,4))
+        plt.plot(Ht_rk4, label="RK4")
+        plt.plot(Ht_lf, label="Leapfrog")
+        plt.xlabel("step"); plt.ylabel("Energy")
+        plt.title("Energy Stability: RK4 vs Leapfrog")
+        plt.legend(frameon=False)
+        plt.tight_layout(); plt.savefig(os.path.join(outdir, "energy_rk4_vs_leapfrog.png"), dpi=150); plt.close()
+
         print(f"Saved plots to: {outdir}")
 
 if __name__ == "__main__":
