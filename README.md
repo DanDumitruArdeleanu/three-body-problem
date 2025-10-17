@@ -162,15 +162,15 @@ python HNN.py --load ./hnn.pt --test-json ./HNN_test.json --rollout-steps 400
 - `--rollout-K INT` — if `>0`, also train a K‑step short‑horizon objective in addition to 1‑step.
 
 ### Evaluation & plotting
-- `--rollout-steps INT` — steps to roll out for eval/plots (default `200`).
+- `--rollout-steps INT` — steps to roll out for evaluation/plots (default `200`).
 - `--integrator {rk4,leapfrog}` — integrator for evaluation rollouts (default `rk4`).
 - `--plot-batch-index INT` — which trajectory in the batch to overlay in plots (default `0`).
 
 ### General I/O / device
 - `--save PATH` — where to save the checkpoint (default `./hnn.pt`).
-- `--load PATH` — load an existing checkpoint before training/eval.
+- `--load PATH` — load an existing checkpoint before training/evaluation.
 - `--device {cpu,cuda}` — computation device (default `cpu`).
-- `--metrics-csv PATH` — write training/eval CSV (default `plots/metrics.csv`).
+- `--metrics-csv PATH` — write training/evaluation CSV (default `plots/metrics.csv`).
 
 ---
 
