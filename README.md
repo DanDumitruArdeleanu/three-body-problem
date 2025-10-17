@@ -103,24 +103,24 @@ If `z_next` is present and `dz` is not, the script auto‑switches to `--mode ro
 
 **(A)** Rollout training on next‑state labels (default for the provided JSON):
 ```bash
-python HNN.py --train-json HNN_train.json --test-json HNN_test.json   --mode rollout --epochs 100 --batch 1024 --dt 1e-3 --save runs/hnn.pt
+python HNN.py --train-json ./HNN_train.json --test-json ./HNN_test.json --mode rollout --epochs 100 --batch 1024 --dt 1e-3 --save ./hnn.pt
 ```
 
 **(B)** Vector‑field training on time derivatives (if you have `dz`):
 ```bash
-python HNN.py --train-json HNN_train.json   --mode vfield --epochs 100 --batch 1024 --lr 1e-3 --save runs/hnn.pt
+python HNN.py --train-json ./HNN_train.json --mode vfield --epochs 100 --batch 1024 --lr 1e-3 --save ./hnn.pt
 ```
 
 **(C)** Using raw `.npy` arrays instead of JSON:
 ```bash
-python HNN.py --train-z path/to/z.npy --train-dz path/to/dz.npy --mode vfield
+python HNN.py --train-z ./z.npy --train-dz ./dz.npy --mode vfield
 # or
-python HNN.py --train-z path/to/z.npy --train-z-next path/to/z_next.npy --mode rollout
+python HNN.py --train-z ./z.npy --train-z-next ./z_next.npy --mode rollout
 ```
 
 **(D)** Evaluate a checkpoint and make plots:
 ```bash
-python HNN.py --load runs/hnn.pt --test-json HNN_test.json --rollout-steps 400
+python HNN.py --load ./hnn.pt --test-json ./HNN_test.json --rollout-steps 400
 ```
 
 ### What gets saved
