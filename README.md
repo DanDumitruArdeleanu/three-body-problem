@@ -77,7 +77,7 @@ Change these fields to control dataset size and nature:
 - **`n_bodies`**: number of bodies. Must match the HNN dimensionality (see `--n-bodies`).  
 - **`capture_steps`**: `None` yields sequential pairs `(z_t -> z_{t+1})`. Provide a list like `[1,2,3,5,10]` to create non‑sequential samples at those offsets from the initial state.  
 - **`D`**: spatial dimension (3 by default).  
-- Advanced: **`start_dist`, `eps`, `G`, `m`** tune initial separations, softening, gravitational constant, and mass; velocities are balanced to zero total momentum.
+- Bonus: **`start_dist`, `eps`, `G`, `m`** tune initial separations, softening, gravitational constant, and mass; velocities are balanced to zero total momentum.
 
 Outputs are written next to the script as `HNN_train.json` and `HNN_test.json`. Simple sanity plots are shown at the end.
 
@@ -94,31 +94,31 @@ python HNN.py
 
 ### Data formats accepted
 The script accepts JSON with any of the following keys (aliases are handled internally):
-- **Training**: `z` (a.k.a. `X`) and either `dz` (a.k.a. `Y`) for vfield mode or `z_next` (a.k.a. `y`) for rollout mode. You can also include a scalar `dt`.  
-- **Evaluation**: `z0` for initial conditions; or `z` / `z_next` pairs for one‑step metrics.
+- Training: `z` (a.k.a. `X`) and either `dz` (a.k.a. `Y`) for vfield mode or `z_next` (a.k.a. `y`) for rollout mode. You can also include a scalar `dt`.  
+- Evaluation: `z0` for initial conditions; or `z` / `z_next` pairs for one‑step metrics.
 
 If `z_next` is present and `dz` is not, the script auto‑switches to `--mode rollout`.
 
 ### Common recipes
 
-**(A) Rollout training on next‑state labels (default for the provided JSON):**
+**(A)** Rollout training on next‑state labels (default for the provided JSON):
 ```bash
 python HNN.py --train-json HNN_train.json --test-json HNN_test.json   --mode rollout --epochs 100 --batch 1024 --dt 1e-3 --save runs/hnn.pt
 ```
 
-**(B) Vector‑field training on time derivatives (if you have `dz`):**
+**(B)** Vector‑field training on time derivatives (if you have `dz`):
 ```bash
 python HNN.py --train-json HNN_train.json   --mode vfield --epochs 100 --batch 1024 --lr 1e-3 --save runs/hnn.pt
 ```
 
-**(C) Using raw `.npy` arrays instead of JSON:**
+**(C)** Using raw `.npy` arrays instead of JSON:
 ```bash
 python HNN.py --train-z path/to/z.npy --train-dz path/to/dz.npy --mode vfield
 # or
 python HNN.py --train-z path/to/z.npy --train-z-next path/to/z_next.npy --mode rollout
 ```
 
-**(D) Evaluate a checkpoint and make plots:**
+**(D)** Evaluate a checkpoint and make plots:
 ```bash
 python HNN.py --load runs/hnn.pt --test-json HNN_test.json --rollout-steps 400
 ```
