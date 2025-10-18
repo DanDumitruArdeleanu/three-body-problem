@@ -393,12 +393,12 @@ def main():
     parser.add_argument("--pair-dist", type=float, default=1.0)
     # Train
     parser.add_argument("--mode", type=str, default="vfield", choices=["vfield", "rollout"])
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=420)
     # Eval
-    parser.add_argument("--rollout-steps", type=int, default=200)
+    parser.add_argument("--rollout-steps", type=int, default=500)
     # IO
     parser.add_argument("--save", type=str, default="./hnn.pt")
     parser.add_argument("--load", type=str, default=None)
