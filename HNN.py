@@ -102,7 +102,14 @@ class HNN(nn.Module):
         self.register_buffer("z_std",  torch.ones(2*self.ndof))
 
         if separable:
-            self.V_net = build_mlp(in_dim=self.ndof, out_dim=1, hidden=hidden, depth=depth)
+            self.n_pairs = n_bodies * (n_bodies - 1) // 2
+            
+            # V_net input = N(N-1)/2 pairwise (squared) distances
+            self.V_net = build_mlp(in_dim=self.n_pairs, out_dim=1, hidden=hidden, depth=depth)
+            
+            # Get (i, j) pairs where i < j
+            idx = torch.triu_indices(n_bodies, n_bodies, 1)
+            self.register_buffer("pair_idx", idx)
             if learn_mass:
                 if tie_body_mass:
                     self.log_m_body = nn.Parameter(torch.zeros(self.n_bodies))  # per body
@@ -133,9 +140,29 @@ class HNN(nn.Module):
         return 0.5 * (p.pow(2) * Minv).sum(dim=1, keepdim=True)  # [B,1]
 
     def potential(self, q: torch.Tensor) -> torch.Tensor:
-        # Normalize q part only
-        qn = (q - self.z_mean[:self.ndof]) / (self.z_std[:self.ndof] + 1e-8)
-        return self.V_net(qn)  # [B,1]
+        # q is [B, ndof], (B = batch_size)
+        
+        # Reshape q from [B, 9] -> [B, 3, 3] (Batch, n_bodies, Dims)
+        q_reshaped = q.view(-1, self.n_bodies, 3)
+
+        # Get the q for each body in each pair
+        # self.pair_idx[0] = [0, 0, 1] (indices for i)
+        # self.pair_idx[1] = [1, 2, 2] (indices for j)
+        q_i = q_reshaped[:, self.pair_idx[0]]  # [B, n_pairs, 3]
+        q_j = q_reshaped[:, self.pair_idx[1]]  # [B, n_pairs, 3]
+
+        # Compute relative positions and squared distances
+        r_ij = q_i - q_j                      
+        d_sq = r_ij.pow(2).sum(dim=-1)
+        
+        # Add a small epsilon to prevent division by zero
+        # Compute r = sqrt(d^2)
+        d_ij = torch.sqrt(d_sq + 1e-8) 
+        
+        # And feed the network 1/r
+        V_features = 1.0 / d_ij
+        
+        return self.V_net(V_features)
 
     def hamiltonian(self, z: torch.Tensor) -> torch.Tensor:
         if self.separable:
@@ -154,16 +181,38 @@ class HNN(nn.Module):
             if not z.requires_grad:
                 z = z.clone().requires_grad_(True)
 
-            H = self.hamiltonian(z)                             # [B]
+            H = self.hamiltonian(z) # [B]
             # Keep the graph so gradients can flow through RK4 unrolled steps
             grad = torch.autograd.grad(H.sum(), z, create_graph=True)[0]  # [B, 2*ndof]
-            dzdt = torch.matmul(grad, self.J.t())               # [B, 2*ndof]
+            dzdt = torch.matmul(grad, self.J.t()) # [B, 2*ndof]
             dqdt, dpdt = torch.split(dzdt, [self.ndof, self.ndof], dim=1)
 
+            # Apply constraints first if they exist
             if self.constraint_fn is not None:
-                dqdt, dpdt = self._apply_constraints(z, dqdt, dpdt)
+                # This function returns constraint-respecting velocities and forces
+                dqdt, dpdt = self._apply_constraints(z, dqdt, dpdt) 
 
-            return torch.cat([dqdt, dpdt], dim=1)
+            # Apply manual momentum conservation after all other forces
+            B = z.size(0)
+            
+            # Reshape dpdt (which is either from autograd or from constraints)
+            dpdt_reshaped = dpdt.view(B, self.n_bodies, 3)
+            
+            # Get particle masses [1, n_bodies, 1]
+            if self.tie_body_mass:
+                masses = self.log_m_body.exp().view(1, -1, 1)
+            else:
+                masses = self.log_m.exp().view(1, self.n_bodies, 3).mean(dim=-1, keepdim=True) # Approx
+            
+            # Calculate center of mass acceleration: a_com = sum(f_i) / sum(m_i)
+            # Add epsilon for numerical stability
+            a_com = dpdt_reshaped.sum(dim=1, keepdim=True) / (masses.sum(dim=1, keepdim=True) + 1e-8)
+            
+            # Subtract the mass-proportional correction: f'_i = f_i - m_i * a_com
+            dpdt_corrected = (dpdt_reshaped - masses * a_com).view(B, -1)
+
+            # Return the final corrected versions
+            return torch.cat([dqdt, dpdt_corrected], dim=1)
 
     def _apply_constraints(self, z: torch.Tensor, dqdt: torch.Tensor, dpdt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Finzi et al. (CHNN): project velocities into tangent space and apply constraint forces.
@@ -230,7 +279,7 @@ def rollout(fstep, f, z0: torch.Tensor, steps: int, dt: float) -> torch.Tensor:
 def train_epoch_vfield(model: HNN, x: torch.Tensor, ydot: torch.Tensor, batch_size: int = 1024, lr: float = 1e-3) -> float:
     # Vector-field supervision (Greydanus): minimize ||f_theta(z) - \dot{z}||^2.
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     total = 0.0
     N = x.size(0)
     for i in range(0, N, batch_size):
@@ -245,7 +294,7 @@ def train_epoch_vfield(model: HNN, x: torch.Tensor, ydot: torch.Tensor, batch_si
 def train_epoch_rollout(model: HNN, z_t: torch.Tensor, z_tp1: torch.Tensor, dt: float, batch_size: int = 1024, lr: float = 1e-3) -> float:
     # One-step RK4 rollout supervision (Neural-ODE flavor from HNN-ODEs repo).
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     total = 0.0
     N = z_t.size(0)
     for i in range(0, N, batch_size):
@@ -260,7 +309,7 @@ def train_epoch_rollout(model: HNN, z_t: torch.Tensor, z_tp1: torch.Tensor, dt: 
 def train_epoch_rolloutK(model: HNN, z_t: torch.Tensor, z_targets: torch.Tensor, dt: float, K: int = 4, batch_size: int = 256, lr: float = 1e-3) -> float:
     # Multi-step free rollout supervision (short horizon), common in ODE-style training.
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     total = 0.0
     N = z_t.size(0)
     for i in range(0, N, batch_size):
@@ -393,7 +442,7 @@ def main():
     parser.add_argument("--pair-dist", type=float, default=1.0)
     # Train
     parser.add_argument("--mode", type=str, default="vfield", choices=["vfield", "rollout"])
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=420)
