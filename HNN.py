@@ -395,7 +395,7 @@ def main():
     parser.add_argument("--mode", type=str, default="vfield", choices=["vfield", "rollout"])
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=1024)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=420)
     # Eval
     parser.add_argument("--rollout-steps", type=int, default=200)
@@ -634,29 +634,33 @@ def main():
         bidx = 0
         Path(outdir).mkdir(parents=True, exist_ok=True)
 
-        # Per-body overlays
+        # Get time axis
+        T_cmp = q_pred.shape[0]
+        t = np.arange(T_cmp)
+        
+        # Plot position components (x,y,z) vs time for each body
         for b in range(n_bodies):
-            plt.figure(figsize=(6, 6))
-            plt.plot(q_true[:, bidx, b, 0], q_true[:, bidx, b, 1], '-',  alpha=0.85, label='true')
-            plt.plot(q_pred[:, bidx, b, 0], q_pred[:, bidx, b, 1], '--', alpha=0.9,  label='pred')
-            plt.title(f"Body {b} — True vs Predicted (x–y)")
-            plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal")
-            plt.grid(True, alpha=0.3); plt.legend(frameon=False)
+            plt.figure(figsize=(10, 5))
+            
+            # Plot x, y, z components
+            for d_idx, d_label in enumerate(['x', 'y', 'z']):
+                # Plot true component
+                plt.plot(t, q_true[:, bidx, b, d_idx], '-',  alpha=0.7, 
+                         label=f'true b{b} ({d_label})')
+                # Plot predicted component
+                plt.plot(t, q_pred[:, bidx, b, d_idx], '--', alpha=0.9, 
+                         label=f'pred b{b} ({d_label})')
+            
+            plt.title(f"Body {b} — True vs Predicted (Position vs. Time)")
+            plt.xlabel("Time Step")
+            plt.ylabel("Position")
+            plt.grid(True, alpha=0.3)
+            plt.legend(frameon=False, ncol=3) # Arrange legend in 3 columns
             plt.tight_layout()
-            plt.savefig(os.path.join(outdir, f"true_vs_pred_body{b}_xy.png"), dpi=150)
+            plt.savefig(os.path.join(outdir, f"true_vs_pred_body{b}_time.png"), dpi=150)
             plt.close()
-
-        # All bodies together
-        plt.figure(figsize=(6, 6))
-        for b in range(n_bodies):
-            plt.plot(q_true[:, bidx, b, 0], q_true[:, bidx, b, 1], '-',  alpha=0.65, label=f"true b{b}")
-            plt.plot(q_pred[:, bidx, b, 0], q_pred[:, bidx, b, 1], '--', alpha=0.85, label=f"pred b{b}")
-        plt.title("All bodies — True vs Predicted (x–y)")
-        plt.xlabel("x"); plt.ylabel("y"); plt.axis("equal")
-        plt.grid(True, alpha=0.3); plt.legend(frameon=False, ncol=2)
-        plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "true_vs_pred_allbodies_xy.png"), dpi=150)
-        plt.close()
+            
+        print("Saved position-vs-time trajectory overlays to ./plots/")
 
         # error curve (RMSE over time)
         err = (traj_pred_cmp - traj_true_cmp).detach().cpu().numpy()

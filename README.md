@@ -126,7 +126,7 @@ python HNN.py --load ./hnn.pt --test-json ./HNN_test.json --rollout-steps 400
 ### What gets saved
 - Checkpoint: `--save` (default `./hnn.pt`) stores model weights + CLI config.  
 - Metrics: `plots/metrics.csv` (epoch, loss, RMSE).  
-- Figures in `./plots/`: training curves, energy drift, momentum over time, true‑vs‑pred overlays, RK4 vs Leapfrog energy, etc.
+- Figures in `./plots/`: training curves, energy drift, momentum over time, per-body line plots of true‑vs‑predicted positions over time, RK4 vs Leapfrog energy, etc:
 
 ---
 
