@@ -8,7 +8,7 @@ import os
 
 class DataGenerator():
     def __init__(self, D, n_bodies, max_steps, capture_steps, n, timestep,
-                 start_dist = 0.01, eps = 0.1, G = 1, m = 1):
+                 start_dist = 0.01, eps = 0.1, G = 1, m = 1, box_halfwidth =0.5):
         self.D = D
         self.n_bodies = n_bodies
         self.max_steps = max_steps
@@ -18,7 +18,15 @@ class DataGenerator():
         self.start_dist = start_dist
         self.eps = eps
         self.G = G
-        self.m = m
+        self.box_halfwidth = float(box_halfwidth)
+
+        if np.isscalar(m):
+            self.masses = np.full((n_bodies,), float(m))
+        else:
+            self.masses = np.asarray(m, dtype=float)
+            assert self.masses.shape == (n_bodies,), \
+                f"m must be scalar or shape ({n_bodies},), got {self.masses.shape}"
+            assert np.all(self.masses > 0), "All masses must be > 0."
         
         self.X = []
         self.y = []
@@ -30,42 +38,71 @@ class DataGenerator():
         D = self.D
         bodies = []
 
-        for _ in range(self.n_bodies):
-            pos = None
-            vel = None
-            smallest_distance = 0
-            while smallest_distance < self.start_dist:
-                pos = np.random.uniform(-0.5, 0.5, size=D)
-                vel = np.random.uniform(-1, 1, size=D)
-                smallest_distance = float('inf')
-                for body in bodies:
-                    dist = self.euclidian_distance(pos, body[:D])
-                    if dist < smallest_distance:
-                        smallest_distance = dist
-                    
-            bodies.append(np.concatenate([pos, vel]))
+        # Working copies we can gently relax if placement gets hard
+        hw = float(self.box_halfwidth)      # half-width of the placement box
+        min_sep = float(self.start_dist)
 
-        # zero total momentum to prevent drift
-        total_momentum = np.sum([b[D:] for b in bodies], axis=0)
-        for b in bodies:
-            b[D:] -= total_momentum / float(self.n_bodies)
+        # Tunables for robustness (adjust if you like)
+        max_tries_per_body = 5000           # hard cap per body
+        expand_every = 1000                 # every N failed tries -> expand box
+        relax_every  = 2000                 # every N failed tries -> relax min_sep
+
+        for b in range(self.n_bodies):
+            placed = False
+            tries = 0
+            while not placed:
+                pos = np.random.uniform(-hw, hw, size=D)
+                vel = np.random.uniform(-1, 1, size=D)
+
+                if not bodies:
+                    bodies.append(np.concatenate([pos, vel]))
+                    placed = True
+                    break
+
+                # nearest distance to already-placed bodies
+                dmin = min(self.euclidian_distance(pos, body[:D]) for body in bodies)
+
+                if dmin >= min_sep:
+                    bodies.append(np.concatenate([pos, vel]))
+                    placed = True
+                    break
+
+                # Failed attempt -> update counters and (occasionally) relax constraints
+                tries += 1
+                if tries % expand_every == 0:
+                    hw *= 1.1          # gently expand search domain
+                if tries % relax_every == 0:
+                    min_sep *= 0.95     # gently relax min separation
+
+                if tries >= max_tries_per_body:
+                    # Final fallback: place anyway and rely on softening (eps) to avoid blow-ups
+                    bodies.append(np.concatenate([pos, vel]))
+                    placed = True
+
+        # Mass-aware COM velocity removal (unchanged)
+        vels = np.stack([b[D:] for b in bodies])         # [N, D]
+        masses = self.masses[:, None]                    # [N, 1]
+        v_com = (masses * vels).sum(axis=0) / masses.sum()
+        for i in range(self.n_bodies):
+            bodies[i][D:] -= v_com
 
         return bodies
 
+
     def compute_accelerations(self, bodies):
         D = self.D
-        
         accelerations = np.zeros((self.n_bodies, D))
         for i in range(self.n_bodies):
             for j in range(self.n_bodies):
-                if i != j:
-                    r_vec = bodies[j][:D] - bodies[i][:D]
-                    dist2 = np.dot(r_vec, r_vec) + self.eps**2
-                    inv_dist3 = dist2 ** -1.5
-                    # G and mass are 1 for simplicity
-                    accelerations[i] += self.G * self.m * r_vec * inv_dist3
-                            
+                if i == j:
+                    continue
+                r_vec = bodies[j][:D] - bodies[i][:D]
+                dist2 = np.dot(r_vec, r_vec) + self.eps**2
+                inv_r3 = dist2 ** -1.5
+                m_j = self.masses[j]          # source mass
+                accelerations[i] += self.G * m_j * r_vec * inv_r3
         return accelerations
+
 
     def generate_training_data(self):
         D = self.D
@@ -104,14 +141,12 @@ class DataGenerator():
                 else:
                     if t == self.capture_steps[next_capture]:
                     
-                        self.X.append(np.concatenate([initial_state, [self.timestep * t]]))
+                        self.X.append(state)          # no extra scalar
                         self.y.append(next_state)
-                        
                         next_capture += 1
-                        
                         if next_capture >= len(self.capture_steps):
                             break
-                    
+
                     
                 current_n = len(self.X)
     

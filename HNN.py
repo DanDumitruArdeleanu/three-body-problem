@@ -394,7 +394,7 @@ def main():
     # Train
     parser.add_argument("--mode", type=str, default="vfield", choices=["vfield", "rollout"])
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--batch", type=int, default=1024)
+    parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=420)
     # Eval
