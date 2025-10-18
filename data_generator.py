@@ -162,6 +162,24 @@ class DataGenerator():
         
         return np.array(self.X), np.array(self.y)
     
+def reformat_batch_for_hnn(batch, masses, D, n_bodies):
+    N = batch.shape[0]
+    # [N, n_bodies, 2*D] -> (q,v) per body
+    batch_reshaped = batch.reshape(N, n_bodies, 2 * D)
+    
+    # Extract all q's and v's
+    q_batch = batch_reshaped[:, :, :D].reshape(N, n_bodies * D) # [N, n_bodies*D]
+    v_batch = batch_reshaped[:, :, D:].reshape(N, n_bodies * D) # [N, n_bodies*D]
+    
+    # (p = m*v)
+    # [n_bodies*D] = [m0,m0,m0, m1,m1,m1, ...]
+    masses_tiled = np.repeat(masses, D)
+    # v_batch * masses_tiled
+    p_batch = v_batch * masses_tiled[None, :] 
+    
+    # Concatenate to [q_all, p_all]
+    return np.concatenate([q_batch, p_batch], axis=1)
+    
 def main():
     start_time = time.time()
     capture_steps = [1, 2, 3, 5, 10]
@@ -184,20 +202,32 @@ def main():
 
     # =-=-=-=-=-=-=-=-= SAVE DATA =-=-=-=-=-=-=-=-=-=
 
+    D_gen = train_generator.D
+    n_b_gen = train_generator.n_bodies
+    m_gen = train_generator.masses # [n_bodies]
+
     X_train, y_train = train_data
-    X_train = X_train.tolist()
-    y_train = y_train.tolist()
+    
+    # Convert to [q, p]
+    X_train_hnn = reformat_batch_for_hnn(X_train, m_gen, D_gen, n_b_gen)
+    y_train_hnn = reformat_batch_for_hnn(y_train, m_gen, D_gen, n_b_gen)
 
     train_dict = {
-        "X": X_train,
-        "y": y_train 
+        "X": X_train_hnn.tolist(), # 'X', 'y'
+        "y": y_train_hnn.tolist(),
+        "dt": train_generator.timestep
     }
 
     X_test, y_test = test_data
-    X_test = X_test.tolist()
+    
+    # Convert to HNN format
+    X_test_hnn = reformat_batch_for_hnn(X_test, m_gen, D_gen, n_b_gen)
+    y_test_hnn = reformat_batch_for_hnn(y_test, m_gen, D_gen, n_b_gen)
 
     test_dict = {
-        "X": X_test,
+        "X": X_test_hnn.tolist(), # z0
+        "y": y_test_hnn.tolist(), # z1
+        "dt": test_generator.timestep
     }
 
     with open(os.path.join(os.getcwd(),"HNN_train.json"), "w") as f:
