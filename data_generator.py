@@ -8,7 +8,7 @@ import os
 
 class DataGenerator():
     def __init__(self, D, n_bodies, max_steps, capture_steps, n, timestep,
-                 start_dist = 0.01, eps = 0.1, G = 1, m = 1, box_halfwidth =100):
+                 start_dist = 0.01, eps = 1, G = 1, m = 1, box_halfwidth =4.0):
         self.D = D
         self.n_bodies = n_bodies
         self.max_steps = max_steps

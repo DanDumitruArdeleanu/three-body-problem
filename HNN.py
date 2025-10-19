@@ -430,7 +430,7 @@ def main():
     # Model
     parser.add_argument("--n-bodies", type=int, required=False, help="Auto-detected from z if not set")
     parser.add_argument("--hidden", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--separable", action="store_true", help="Use separable H=T(p)+V(q) (default if flag set)")
     parser.add_argument("--no-learn-mass", action="store_true", help="Disable learned masses")
     parser.add_argument("--no-tie-body-mass", action="store_true", help="Do not tie masses across x/y/z per body")
