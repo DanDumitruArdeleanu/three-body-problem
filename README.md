@@ -206,7 +206,7 @@ These confirm that the HNN preserves physical invariants and matches the generat
 
 - Shape error like “`expected D divisible by 6`”: make sure `--n-bodies` matches the dataset dimensionality (`D = 6 * n_bodies`).  
 - Switching modes unexpectedly: if your training NPZ has `z_next` but not `dz`, the script switches to `--mode rollout`.  
-- No plots: ensure you ran with `--test-json` or `--val-z0`, and that the `plots/` folder is writable.  
+- No plots: ensure you ran with `--test-npz` or `--val-z0`, and that the `plots/` folder is writable.  
 - CUDA not found: your PyTorch build may be CPU‑only; re‑install a CUDA build or use `--device cpu`.
 
 ---
