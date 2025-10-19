@@ -447,7 +447,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=420)
     # Eval
-    parser.add_argument("--rollout-steps", type=int, default=500)
+    parser.add_argument("--rollout-steps", type=int, default=150)
     # IO
     parser.add_argument("--save", type=str, default="./hnn.pt")
     parser.add_argument("--load", type=str, default=None)
