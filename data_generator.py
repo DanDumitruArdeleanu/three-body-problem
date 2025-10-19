@@ -212,11 +212,15 @@ def main():
     X_train_hnn = reformat_batch_for_hnn(X_train, m_gen, D_gen, n_b_gen)
     y_train_hnn = reformat_batch_for_hnn(y_train, m_gen, D_gen, n_b_gen)
 
-    train_dict = {
-        "X": X_train_hnn.tolist(), # 'X', 'y'
-        "y": y_train_hnn.tolist(),
-        "dt": train_generator.timestep
-    }
+    # --- Save as efficient .npz ---
+    print("Saving training data to HNN_train.npz")
+    np.savez(
+        os.path.join(os.getcwd(), "HNN_train.npz"),
+        X=X_train_hnn,  # Save raw array, not .tolist()
+        y=y_train_hnn,
+        dt=np.array(train_generator.timestep) # Save dt as a 0-dim array
+    )
+    # --- END ---
 
     X_test, y_test = test_data
     
@@ -224,17 +228,15 @@ def main():
     X_test_hnn = reformat_batch_for_hnn(X_test, m_gen, D_gen, n_b_gen)
     y_test_hnn = reformat_batch_for_hnn(y_test, m_gen, D_gen, n_b_gen)
 
-    test_dict = {
-        "X": X_test_hnn.tolist(), # z0
-        "y": y_test_hnn.tolist(), # z1
-        "dt": test_generator.timestep
-    }
-
-    with open(os.path.join(os.getcwd(),"HNN_train.json"), "w") as f:
-        json.dump(train_dict, f)
-        
-    with open(os.path.join(os.getcwd(),"HNN_test.json"), "w") as f:
-        json.dump(test_dict, f)
+    # --- Save as efficient .npz ---
+    print("Saving test data to HNN_test.npz")
+    np.savez(
+        os.path.join(os.getcwd(), "HNN_test.npz"),
+        X=X_test_hnn,
+        y=y_test_hnn,
+        dt=np.array(test_generator.timestep)
+    )
+    # --- END ---
         
     plt.plot(y_train[:1000])
     plt.show()

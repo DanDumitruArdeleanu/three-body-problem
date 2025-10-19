@@ -6,13 +6,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 import random
-import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
-import os
 import csv
+from torch.utils.data import TensorDataset, DataLoader
 
 # Utilities
 def seed_all(seed=420):
@@ -96,73 +95,86 @@ class HNN(nn.Module):
         self.separable = separable
         self.learn_mass = learn_mass
         self.tie_body_mass = tie_body_mass
+        self.depth = depth  # <-- make sure this exists if you reference it
 
         # Normalization buffers
-        self.register_buffer("z_mean", torch.zeros(2*self.ndof))
-        self.register_buffer("z_std",  torch.ones(2*self.ndof))
+        self.register_buffer("z_mean", torch.zeros(2 * self.ndof))
+        self.register_buffer("z_std",  torch.ones(2 * self.ndof))
 
         if separable:
             self.n_pairs = n_bodies * (n_bodies - 1) // 2
-            
-            # V_net input = N(N-1)/2 pairwise (squared) distances
-            self.V_net = build_mlp(in_dim=self.n_pairs, out_dim=1, hidden=hidden, depth=depth)
-            
-            # Get (i, j) pairs where i < j
-            idx = torch.triu_indices(n_bodies, n_bodies, 1)
-            self.register_buffer("pair_idx", idx)
-            if learn_mass:
-                if tie_body_mass:
-                    self.log_m_body = nn.Parameter(torch.zeros(self.n_bodies))  # per body
-                else:
-                    self.log_m = nn.Parameter(torch.zeros(self.ndof))           # per DOF
-            else:
-                if tie_body_mass:
-                    self.register_buffer("log_m_body", torch.zeros(self.n_bodies))
-                else:
-                    self.register_buffer("log_m", torch.zeros(self.ndof))
+            pair_idx = torch.triu_indices(n_bodies, n_bodies, 1)
+            self.register_buffer("pair_idx", pair_idx)  # [2, n_pairs]
+
+            # shared per-pair MLP φ: R -> R, applied per pair then summed
+            self.phi_pair = build_mlp(
+                in_dim=1, out_dim=1,
+                hidden=max(16, hidden // 2),
+                depth=max(2, depth - 1)
+            )
         else:
-            self.mlp = build_mlp(in_dim=2 * self.ndof, out_dim=1, hidden=hidden, depth=depth)
+            self.mlp = build_mlp(
+                in_dim=2 * self.ndof, out_dim=1,
+                hidden=hidden, depth=depth
+            )
+
+        if learn_mass:
+            if tie_body_mass:
+                self.log_m_body = nn.Parameter(torch.zeros(n_bodies))      # [N]
+            else:
+                self.log_m_dof  = nn.Parameter(torch.zeros(3 * n_bodies))  # [3N]
+        else:
+            # fixed unit masses (buffers, not trainable)
+            self.register_buffer("m_body_fixed", torch.ones(n_bodies))
 
         # Canonical symplectic form J = [[0, I], [-I, 0]]
-        J = torch.zeros(2*self.ndof, 2*self.ndof)
-        J[:self.ndof, self.ndof:] = torch.eye(self.ndof)
-        J[self.ndof:, :self.ndof] = -torch.eye(self.ndof)
+        D = torch.get_default_dtype()
+        J = torch.zeros(2 * self.ndof, 2 * self.ndof, dtype=D)
+        I = torch.eye(self.ndof, dtype=D)
+        J[:self.ndof, self.ndof:] = I
+        J[self.ndof:, :self.ndof] = -I
         self.register_buffer("J", J)
+        self.register_buffer("softening_eps", torch.tensor(0.1))  # default; override if you want
 
     # Energies
     def kinetic(self, p: torch.Tensor) -> torch.Tensor:
-        # p: [B, ndof]
-        if self.tie_body_mass:
-            M = self.log_m_body.exp().repeat_interleave(3)  # [ndof]
+        # p: [B, ndof], ndof=3*N
+        if self.learn_mass:
+            if hasattr(self, "log_m_body"):
+                m_vec = self.log_m_body.exp().repeat_interleave(3)      # [3N]
+            else:
+                m_vec = self.log_m_dof.exp()                            # [3N]
         else:
-            M = self.log_m.exp()
-        Minv = 1.0 / (M + 1e-8)
-        return 0.5 * (p.pow(2) * Minv).sum(dim=1, keepdim=True)  # [B,1]
+            m_vec = torch.ones(self.ndof, device=p.device, dtype=p.dtype)
+
+        Minv = 1.0 / (m_vec + 1e-8)                                     # [3N]
+        return 0.5 * (p.pow(2) * Minv.unsqueeze(0)).sum(dim=1, keepdim=True)
 
     def potential(self, q: torch.Tensor) -> torch.Tensor:
-        # q is [B, ndof], (B = batch_size)
-        
-        # Reshape q from [B, 9] -> [B, 3, 3] (Batch, n_bodies, Dims)
-        q_reshaped = q.view(-1, self.n_bodies, 3)
+        B = q.size(0)
+        q_b = q.view(B, self.n_bodies, 3)
+        qi = q_b[:, self.pair_idx[0]]
+        qj = q_b[:, self.pair_idx[1]]
 
-        # Get the q for each body in each pair
-        # self.pair_idx[0] = [0, 0, 1] (indices for i)
-        # self.pair_idx[1] = [1, 2, 2] (indices for j)
-        q_i = q_reshaped[:, self.pair_idx[0]]  # [B, n_pairs, 3]
-        q_j = q_reshaped[:, self.pair_idx[1]]  # [B, n_pairs, 3]
+        eps2 = float(self.softening_eps.item()) ** 2
+        d = torch.sqrt(((qi - qj) ** 2).sum(-1) + eps2)     # [B, n_pairs]
 
-        # Compute relative positions and squared distances
-        r_ij = q_i - q_j                      
-        d_sq = r_ij.pow(2).sum(dim=-1)
-        
-        # Add a small epsilon to prevent division by zero
-        # Compute r = sqrt(d^2)
-        d_ij = torch.sqrt(d_sq + 1e-8) 
-        
-        # And feed the network 1/r
-        V_features = 1.0 / d_ij
-        
-        return self.V_net(V_features)
+        # Choose one input to phi:  1/d  (simple & works well)
+        s = (1.0 / d).unsqueeze(-1)                         # [B, n_pairs, 1]
+
+        # if not self.learn_mass:
+        #     m = self.m_body_fixed                          # [N]
+        # elif hasattr(self, "log_m_body"):
+        #     m = self.log_m_body.exp()                      # [N]
+        # else:
+        #     m = self.log_m_dof.view(self.n_bodies, 3).exp().mean(-1)  # [N]
+        # mi = m[self.pair_idx[0]]; mj = m[self.pair_idx[1]]             # [n_pairs]
+        # mass_pair = (mi * mj).unsqueeze(0).unsqueeze(-1)               # [1,n_pairs,1]
+        # s = (mass_pair / d.unsqueeze(-1))                               # [B,n_pairs,1]
+
+        v_ij = self.phi_pair(s).squeeze(-1)                 # [B, n_pairs]
+        return v_ij.sum(dim=1, keepdim=True)                # [B, 1]
+
 
     def hamiltonian(self, z: torch.Tensor) -> torch.Tensor:
         if self.separable:
@@ -177,80 +189,109 @@ class HNN(nn.Module):
     def time_derivatives(self, z: torch.Tensor) -> torch.Tensor:
         # Classic HNN: dz/dt = J grad_z H
         with torch.enable_grad():
-            # don't sever the graph; just ensure z requires grad
+            # Ensure z participates in autograd
             if not z.requires_grad:
                 z = z.clone().requires_grad_(True)
 
-            H = self.hamiltonian(z) # [B]
-            # Keep the graph so gradients can flow through RK4 unrolled steps
-            grad = torch.autograd.grad(H.sum(), z, create_graph=True)[0]  # [B, 2*ndof]
-            dzdt = torch.matmul(grad, self.J.t()) # [B, 2*ndof]
-            dqdt, dpdt = torch.split(dzdt, [self.ndof, self.ndof], dim=1)
+            H = self.hamiltonian(z)                           # [B]
+            (grad,) = torch.autograd.grad(H.sum(), z, create_graph=True)  # [B, 2*ndof]
 
-            # Apply constraints first if they exist
+            # Make sure J matches dtype/device of grad
+            J = self.J.to(dtype=grad.dtype, device=grad.device)
+
+            dzdt = grad @ J.t()                               # [B, 2*ndof]
+            dqdt, dpdt = dzdt.split(self.ndof, dim=1)
+
+            # Apply holonomic constraints if provided
             if self.constraint_fn is not None:
-                # This function returns constraint-respecting velocities and forces
-                dqdt, dpdt = self._apply_constraints(z, dqdt, dpdt) 
+                dqdt, dpdt = self._apply_constraints(z, dqdt, dpdt)
 
-            # Apply manual momentum conservation after all other forces
-            B = z.size(0)
-            
-            # Reshape dpdt (which is either from autograd or from constraints)
-            dpdt_reshaped = dpdt.view(B, self.n_bodies, 3)
-            
-            # Get particle masses [1, n_bodies, 1]
-            if self.tie_body_mass:
-                masses = self.log_m_body.exp().view(1, -1, 1)
+            # No manual COM/momentum patch here — conservation should emerge from symmetry
+            return torch.cat([dqdt, dpdt], dim=1)
+        
+    def _minv_vec(self, device=None, dtype=None):
+        """
+        Returns a length-[ndof] tensor with the inverse mass for each coordinate
+        (x,y,z for each body). Handles both tied and untied mass parameters.
+        """
+        device = device if device is not None else self.J.device
+        dtype  = dtype  if dtype  is not None else self.J.dtype
+
+        if not self.learn_mass:
+            m_per_body = self.m_body_fixed.to(device=device, dtype=dtype)        # [N]
+            m_per_dof  = m_per_body.repeat_interleave(3)                          # [3N]
+            return 1.0 / (m_per_dof + 1e-8)
+        else:
+            if hasattr(self, "log_m_body"):
+                m_per_body = self.log_m_body.exp().to(device=device, dtype=dtype)          # [N]
             else:
-                masses = self.log_m.exp().view(1, self.n_bodies, 3).mean(dim=-1, keepdim=True) # Approx
-            
-            # Calculate center of mass acceleration: a_com = sum(f_i) / sum(m_i)
-            # Add epsilon for numerical stability
-            a_com = dpdt_reshaped.sum(dim=1, keepdim=True) / (masses.sum(dim=1, keepdim=True) + 1e-8)
-            
-            # Subtract the mass-proportional correction: f'_i = f_i - m_i * a_com
-            dpdt_corrected = (dpdt_reshaped - masses * a_com).view(B, -1)
+                # Untied per-dof (see Fix #3); shape [3N]
+                m_per_dof = self.log_m_dof.exp().to(device=device, dtype=dtype)            # [3N]
+                return (1.0 / (m_per_dof + 1e-8))
 
-            # Return the final corrected versions
-            return torch.cat([dqdt, dpdt_corrected], dim=1)
+        # Tie mass across x,y,z for each body → repeat 3 times
+        m_per_dof = m_per_body.repeat_interleave(3)                                         # [3N]
+        return (1.0 / (m_per_dof + 1e-8))
 
-    def _apply_constraints(self, z: torch.Tensor, dqdt: torch.Tensor, dpdt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Finzi et al. (CHNN): project velocities into tangent space and apply constraint forces.
+    def _apply_constraints(self, z: torch.Tensor, dqdt: torch.Tensor, dpdt: torch.Tensor):
+        """
+        Mass-aware holonomic constraints:
+        Project velocities into the tangent space and correct forces using the
+        Gauss principle with A = J M^{-1} J^T and M^{-1} weighting.
+        """
         B = z.size(0)
-        q = z[:, :self.ndof].detach().requires_grad_(True)
-        g = self.constraint_fn(q.view(B, self.n_bodies, 3))  # [B,k]
+        ndof = self.ndof
+
+        # q for autodiff of constraints
+        q = z[:, :ndof].detach().requires_grad_(True)
+        g = self.constraint_fn(q.view(B, self.n_bodies, 3))  # [B, k] or [B, 1]
         if g.ndim == 1:
             g = g.unsqueeze(1)
         k = g.size(1)
 
-        # Build J = ∂g/∂q : [B,k,ndof]
+        # Build J_q = ∂g/∂q : [B, k, ndof]
         rows = []
         for i in range(k):
             gi = g[:, i].sum()
             Ji = torch.autograd.grad(gi, q, retain_graph=True, allow_unused=False)[0]  # [B, ndof]
             rows.append(Ji)
-        J = torch.stack(rows, dim=1)  # [B,k,ndof]
+        Jq = torch.stack(rows, dim=1)  # [B, k, ndof]
 
-        eye_k = torch.eye(k, device=z.device).unsqueeze(0)
-        A = torch.bmm(J, J.transpose(1,2)) + 1e-6 * eye_k  # [B,k,k]
+        # Inverse mass per dof, broadcast to batch
+        Minv_vec = self._minv_vec(device=z.device, dtype=z.dtype)       # [ndof]
+        Minv     = Minv_vec.unsqueeze(0).expand(B, -1)                   # [B, ndof]
 
-        # 1) Project velocities onto tangent space
-        rhs_v = torch.bmm(J, dqdt.unsqueeze(-1)).squeeze(-1)  # [B,k]
+        eye_k = torch.eye(k, device=z.device, dtype=z.dtype).unsqueeze(0)  # [1,k,k]
+
+        # A = J M^{-1} J^T
+        # (J * Minv) applies Minv along the last dim of J
+        A = torch.bmm(Jq * Minv.unsqueeze(1), Jq.transpose(1, 2)) + 1e-6 * eye_k  # [B,k,k]
+
+        # --- 1) Velocity projection (remove normal component) ---
+        # rhs_v = J M^{-1} v  where v = dqdt
+        rhs_v = torch.bmm(Jq * Minv.unsqueeze(1), dqdt.unsqueeze(-1)).squeeze(-1)  # [B,k]
         try:
-            L = torch.linalg.cholesky(A)
+            L = torch.linalg.cholesky(A)                                # [B,k,k]
             lam_v = torch.cholesky_solve(rhs_v.unsqueeze(-1), L).squeeze(-1)
         except RuntimeError:
             lam_v = torch.linalg.solve(A, rhs_v)
-        dqdt = dqdt - torch.bmm(J.transpose(1,2), lam_v.unsqueeze(-1)).squeeze(-1)
 
-        # 2) Constraint forces correct dpdt
-        rhs_f = torch.bmm(J, dqdt.unsqueeze(-1)).squeeze(-1)
+        # dqdt ← dqdt - M^{-1} J^T λ_v
+        dqdt = dqdt - (Jq.transpose(1, 2) @ lam_v.unsqueeze(-1)).squeeze(-1) * Minv  # [B, ndof]
+
+        # --- 2) Force correction for dpdt (constraint impulses) ---
+        # rhs_f = J M^{-1} a  where a = dpdt (since ṗ = ∂H/∂q + J^T λ, here we just correct)
+        rhs_f = torch.bmm(Jq * Minv.unsqueeze(1), dpdt.unsqueeze(-1)).squeeze(-1)  # [B,k]
         try:
             lam_f = torch.cholesky_solve(rhs_f.unsqueeze(-1), L).squeeze(-1)
-        except Exception:
+        except RuntimeError:
             lam_f = torch.linalg.solve(A, rhs_f)
-        dpdt = dpdt - torch.bmm(J.transpose(1,2), lam_f.unsqueeze(-1)).squeeze(-1)
+
+        # dpdt ← dpdt - M^{-1} J^T λ_f
+        dpdt = dpdt - (Jq.transpose(1, 2) @ lam_f.unsqueeze(-1)).squeeze(-1) * Minv  # [B, ndof]
+
         return dqdt, dpdt
+
 
 # Integration (HNN-ODEs style)
 def euler_step(f: Callable[[torch.Tensor], torch.Tensor], z: torch.Tensor, dt: float) -> torch.Tensor:
@@ -276,40 +317,58 @@ def rollout(fstep, f, z0: torch.Tensor, steps: int, dt: float) -> torch.Tensor:
     return traj
 
 # Training losses (paper-consistent)
-def train_epoch_vfield(model: HNN, x: torch.Tensor, ydot: torch.Tensor, batch_size: int = 1024, lr: float = 1e-3) -> float:
+def train_epoch_vfield(model: HNN, loader: DataLoader, device: str, 
+                       batch_size: int = 1024, lr: float = 1e-3) -> float:
     # Vector-field supervision (Greydanus): minimize ||f_theta(z) - \dot{z}||^2.
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    # Use AdamW for better weight decay
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5) 
     total = 0.0
-    N = x.size(0)
-    for i in range(0, N, batch_size):
-        xb = x[i:i+batch_size]
-        yb = ydot[i:i+batch_size]
+    
+    # Loop over the DataLoader
+    for xb, yb in loader:
+        # <-- Move batch to device inside the loop
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+
         pred = model.time_derivatives(xb)
         loss = F.mse_loss(pred, yb)
+        
         opt.zero_grad(); loss.backward(); opt.step()
-        total += loss.item() * xb.size(0)
-    return total / N
+        # Accumulate loss, weighted by batch size
+        total += loss.item() * xb.size(0) 
+        
+    # Return average loss over the *entire* dataset
+    return total / len(loader.dataset)
 
-def train_epoch_rollout(model: HNN, z_t: torch.Tensor, z_tp1: torch.Tensor, dt: float, batch_size: int = 1024, lr: float = 1e-3) -> float:
-    # One-step RK4 rollout supervision (Neural-ODE flavor from HNN-ODEs repo).
+def train_epoch_rollout(model: HNN, loader: DataLoader, dt: float, device: str,
+                        batch_size: int = 1024, lr: float = 1e-3, stepper: str = "rk4") -> float:
+    step_fn = rk4_step if stepper == "rk4" else leapfrog_step
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    # Use AdamW for better weight decay
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5) 
     total = 0.0
-    N = z_t.size(0)
-    for i in range(0, N, batch_size):
-        zb = z_t[i:i+batch_size]
-        zb_next = z_tp1[i:i+batch_size]
-        z_pred = rk4_step(model.time_derivatives, zb, dt)
+    
+    # Loop over the DataLoader
+    for zb, zb_next in loader:
+        # <-- Move batch to device inside the loop
+        zb = zb.to(device, non_blocking=True)
+        zb_next = zb_next.to(device, non_blocking=True)
+
+        z_pred = step_fn(model.time_derivatives, zb, dt)
         loss = F.mse_loss(z_pred, zb_next)
+        
         opt.zero_grad(); loss.backward(); opt.step()
+        # Accumulate loss, weighted by batch size
         total += loss.item() * zb.size(0)
-    return total / N
+        
+    # Return average loss over the *entire* dataset
+    return total / len(loader.dataset)
 
 def train_epoch_rolloutK(model: HNN, z_t: torch.Tensor, z_targets: torch.Tensor, dt: float, K: int = 4, batch_size: int = 256, lr: float = 1e-3) -> float:
     # Multi-step free rollout supervision (short horizon), common in ODE-style training.
     model.train()
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     total = 0.0
     N = z_t.size(0)
     for i in range(0, N, batch_size):
@@ -420,8 +479,8 @@ def build_constraint(args, n_bodies):
 def main():
     parser = argparse.ArgumentParser(description="All-in-one paper-faithful HNN trainer/evaluator")
     # Data
-    parser.add_argument("--train-json", type=str, default="HNN_train.json", help="JSON with training data (z, dz or z_next, optional dt)")
-    parser.add_argument("--test-json", type=str, default="HNN_test.json", help="JSON with eval data (z0 or z, optional dt)")
+    parser.add_argument("--train-json", type=str, default="HNN_train.npz", help="JSON with training data (z, dz or z_next, optional dt)")
+    parser.add_argument("--test-json", type=str, default="HNN_test.npz", help="JSON with eval data (z0 or z, optional dt)")
     parser.add_argument("--train-z", type=str, help="Path to training states z.npy [N, D]")
     parser.add_argument("--train-dz", type=str, default=None, help="Path to training vector field dz/dt.npy [N, D] (vfield mode)")
     parser.add_argument("--train-z-next", type=str, default=None, help="Path to next states z_{t+1}.npy [N, D] (rollout mode)")
@@ -431,11 +490,11 @@ def main():
     parser.add_argument("--n-bodies", type=int, required=False, help="Auto-detected from z if not set")
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--depth", type=int, default=5)
-    parser.add_argument("--separable", action="store_true", help="Use separable H=T(p)+V(q) (default if flag set)")
+    parser.add_argument("--nonseparable", action="store_true", help="Use general H_theta(q,p) instead of separable H=T(p)+V(q)")
     parser.add_argument("--no-learn-mass", action="store_true", help="Disable learned masses")
     parser.add_argument("--no-tie-body-mass", action="store_true", help="Do not tie masses across x/y/z per body")
     # Constraint
-    parser.add_argument("--constraint", type=str, default=None, choices=[None, "anchor", "pair"])
+    parser.add_argument("--constraint", type=str, default=None, choices=["anchor", "pair"])
     parser.add_argument("--anchor-radius", type=float, default=1.0)
     parser.add_argument("--pair-i", type=int, default=0)
     parser.add_argument("--pair-j", type=int, default=1)
@@ -443,7 +502,7 @@ def main():
     # Train
     parser.add_argument("--mode", type=str, default="vfield", choices=["vfield", "rollout"])
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch", type=int, default=512)
+    parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=420)
     # Eval
@@ -462,10 +521,26 @@ def main():
 
     seed_all(args.seed)
 
-    # Load training data (prefer JSON if available)
+    # --- Define file paths ---
+    train_data_path = "HNN_train.npz"  # <-- Prioritize .npz
+    test_data_path = "HNN_test.npz"    # <-- Prioritize .npz
+    
+    # Load training data
     z = dz = z_next = None  # initialize so they're always defined
 
-    if args.train_json and os.path.exists(args.train_json):
+    # --- Load from NPZ first ---
+    if os.path.exists(train_data_path):
+        print(f"Loading from {train_data_path}")
+        data = np.load(train_data_path)
+        # Load as CPU tensors. Batches will be moved to device in the loop.
+        z = torch.from_numpy(data['X']).float()        # <-- Stays on CPU
+        z_next = torch.from_numpy(data['y']).float()   # <-- Stays on CPU
+        args.dt = float(data['dt'])
+        args.mode = "rollout" # We know .npz data is for rollout
+        print(f"Loaded training NPZ. z: {z.shape}, z_next: {z_next.shape}, dt: {args.dt}")
+
+    # --- Fallback to JSON ---
+    elif args.train_json and os.path.exists(args.train_json):
         jd = load_json_data(args.train_json)
         if 'dt' in jd:
             args.dt = jd['dt']
@@ -476,28 +551,23 @@ def main():
         if z is None:
             raise SystemExit("HNN_train.json must contain at least 'z'")
 
-        # move tensors to device
-        z = z.to(args.device)
-        if dz is not None:
-            dz = dz.to(args.device)
-        if z_next is not None:
-            z_next = z_next.to(args.device)
-
+        # Data stays on CPU
         print(f"Loaded training JSON: {args.train_json}")
 
-        # If next-state labels are provided (and no dz), prefer rollout training
         if z_next is not None and dz is None and args.mode != "rollout":
             print("Detected next-state labels in training JSON -> switching to rollout training.")
             args.mode = "rollout"
-
+            
+    # --- Fallback to NPY ---
     else:
         if args.train_z is None:
             raise SystemExit("--train-z is required when no train JSON is provided")
-        z = load_npy(args.train_z).to(args.device)
+        z = load_npy(args.train_z)
         print(f"Loaded z: {tuple(z.shape)} from {args.train_z}")
+        # (You would also load dz or z_next from .npy here if using that format)
 
     N, D = z.shape
-    # Auto-detect n_bodies if not provided
+    # Auto-detect n_bodies
     if args.n_bodies is None:
         if D % 6 != 0:
             raise SystemExit(f"Cannot infer n_bodies from z.shape={z.shape}; expected D divisible by 6")
@@ -505,11 +575,56 @@ def main():
         print(f"Auto-detected n_bodies = {args.n_bodies}")
     assert D == 2*3*args.n_bodies, "z dimensionality must match n_bodies"
 
-    # Auto-enable separable if not explicitly set
-    if not args.separable:
-        print("Auto-enabling separable Hamiltonian H(q,p)=T(p)+V(q).")
-        args.separable = True
+    # --- Create Train DataLoader ---
+    if args.mode == "rollout":
+        if z_next is None:
+            raise SystemExit("Mode 'rollout' requires 'y' or 'z_next' data.")
+        train_dataset = TensorDataset(z, z_next)
+    else:
+        if dz is None:
+            raise SystemExit("Mode 'vfield' requires 'dz' or 'Y' data.")
+        train_dataset = TensorDataset(z, dz)
 
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch,
+        shuffle=True,                                       # <-- Automatically shuffles data each epoch
+        num_workers = 0 if os.name == "nt" else 4,          # <-- Tune this (e.g., 0, 2, 4)
+        pin_memory=True,                                    # <-- Speeds up CPU-to-GPU transfer
+        drop_last=True                                      # <-- Avoids tiny final batches
+    )
+    print(f"Created Train DataLoader with {len(train_loader)} batches.")
+
+    # Create Val DataLoader (once, before the loop) ---
+    val_loader = None
+    if os.path.exists(test_data_path):
+        print(f"Loading validation data from {test_data_path}")
+        data_val = np.load(test_data_path)
+        z_val = torch.from_numpy(data_val['X']).float()
+        z_next_val = torch.from_numpy(data_val['y']).float()
+        
+        val_dataset = TensorDataset(z_val, z_next_val)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch * 2, # Can use a larger batch for validation
+            shuffle=False,             # No need to shuffle validation data
+            num_workers=2,
+            pin_memory=True
+        )
+        print(f"Created Val DataLoader with {len(val_loader)} batches.")
+    
+    elif args.test_json and os.path.exists(args.test_json):
+        # Fallback to loading test JSON for validation
+        print(f"Loading validation data from {args.test_json}")
+        jd_val = load_json_data(args.test_json)
+        z_val = jd_val.get("z"); z_next_val = jd_val.get("z_next")
+        if z_val is not None and z_next_val is not None:
+            val_dataset = TensorDataset(z_val, z_next_val)
+            val_loader = DataLoader(val_dataset, batch_size=args.batch*2, shuffle=False)
+            print(f"Created Val DataLoader from JSON.")
+
+    # Auto-enable separable if not explicitly set
+    use_separable = not args.nonseparable
 
     # Build model
     constraint_fn = build_constraint(args, args.n_bodies)
@@ -518,13 +633,13 @@ def main():
         hidden=args.hidden,
         depth=args.depth,
         constraint_fn=constraint_fn,
-        separable=args.separable,
+        separable=use_separable,
         learn_mass=not args.no_learn_mass,
         tie_body_mass=not args.no_tie_body_mass,
     ).to(args.device)
 
     # Normalization from training states
-    mean, std = fit_norm(z)
+    mean, std = fit_norm(z) # <-- This is fine, z is still on CPU
     apply_norm(model, mean.to(args.device), std.to(args.device))
 
     # Load checkpoint (optional)
@@ -533,34 +648,53 @@ def main():
         load_checkpoint(args.load, model, map_location=args.device)
 
     # Training diagnostics (RSME curves & metrics CSV)
-    metrics_csv = "plots/metrics.csv"
-    os.makedirs("plots", exist_ok=True)
+    metrics_csv = args.metrics_csv
+    os.makedirs(os.path.dirname(metrics_csv) or ".", exist_ok=True)
 
     train_rmse_hist, val_rmse_hist = [], []
     epochs = args.epochs
 
-    for ep in range(1, epochs+1):
+    # Training Loop ---
+    for ep in range(1, epochs + 1):
         if args.mode == "rollout":
-            loss = train_epoch_rollout(model, z, z_next, args.dt, batch_size=args.batch, lr=args.lr)
-            with torch.no_grad():
-                z_pred = rk4_step(model.time_derivatives, z, args.dt)
-                rmse_train = torch.sqrt(F.mse_loss(z_pred, z_next)).item()
-        else:
-            loss = train_epoch_vfield(model, z, dz, batch_size=args.batch, lr=args.lr)
-            with torch.no_grad():
-                pred_dz = model.time_derivatives(z)
-                rmse_train = torch.sqrt(F.mse_loss(pred_dz, dz)).item()
+            # <-- Pass the loader and device, not the giant tensors
+            loss = train_epoch_rollout(
+                model, train_loader, args.dt, args.device,
+                batch_size=args.batch, lr=args.lr,
+                stepper=("rk4" if args.integrator == "rk4" else "leapfrog"),
+            )
+            # loss is now the epoch's avg MSE, so just sqrt it
+            rmse_train = np.sqrt(loss)
 
-        # Optional validation RMSE
+        else:  # args.mode == "vfield"
+            # Pass the loader and device
+            loss = train_epoch_vfield(model, train_loader, args.device,
+                                      batch_size=args.batch, lr=args.lr)
+            # loss is now the epoch's avg MSE, so just sqrt it
+            rmse_train = np.sqrt(loss)
+
+        # Efficient Validation Loop ---
         rmse_val = None
-        if args.test_json and os.path.exists(args.test_json):
-            jd_val = load_json_data(args.test_json)
-            z_val = jd_val.get("z"); z_next_val = jd_val.get("z_next")
-            if z_val is not None and z_next_val is not None:
-                z_val = z_val.to(args.device); z_next_val = z_next_val.to(args.device)
-                with torch.no_grad():
-                    z_pred_val = rk4_step(model.time_derivatives, z_val, args.dt)
-                    rmse_val = torch.sqrt(F.mse_loss(z_pred_val, z_next_val)).item()
+        if val_loader is not None: # <-- Check if we created a val_loader
+            model.eval()           # <-- Set model to evaluation mode
+            val_loss_total = 0.0
+            step_fn = rk4_step if args.integrator == "rk4" else leapfrog_step # <-- Define step_fn here
+
+            with torch.no_grad():
+                # Loop over validation batches
+                for z_val_b, z_next_val_b in val_loader:
+                    # <-- Move validation batches to device
+                    z_val_b = z_val_b.to(args.device, non_blocking=True)
+                    z_next_val_b = z_next_val_b.to(args.device, non_blocking=True)
+                    
+                    z_pred_val = step_fn(model.time_derivatives, z_val_b, args.dt)
+                    val_loss = F.mse_loss(z_pred_val, z_next_val_b)
+                    # Accumulate loss, weighted by batch size
+                    val_loss_total += val_loss.item() * z_val_b.size(0)
+            
+            # Calculate average RMSE over the entire validation dataset
+            rmse_val = np.sqrt(val_loss_total / len(val_loader.dataset))
+            model.train() # <-- Set model back to train mode
 
         train_rmse_hist.append(rmse_train)
         val_rmse_hist.append(rmse_val if rmse_val is not None else float('nan'))
@@ -677,7 +811,7 @@ def main():
             return q.reshape(T_cmp, -1, n_bodies, 3)
 
         q_pred = _to_q(traj_pred_cmp).cpu().numpy()
-        q_true = _to_q(traj_true_cmp).cpu().numpy() if torch.is_tensor(traj_true_cmp) else q_true
+        q_true = _to_q(traj_true_cmp).cpu().numpy()
 
         # Pick a single trajectory index for clarity (first in batch)
         bidx = 0
@@ -725,7 +859,21 @@ def main():
         print("Saved true vs predicted trajectory overlays to ./plots/")
 
     if args.test_json and os.path.exists(args.test_json):
-        jd = load_json_data(args.test_json)
+        if args.test_json.endswith(".npz"):
+            print(f"Loading eval data from NPZ: {args.test_json}")
+            data = np.load(args.test_json)
+            # Create a 'jd' (json-data-like) dictionary to hold the tensors
+            jd = {}
+            # Load all arrays from NPZ into the dict
+            for key in data:
+                jd[key] = torch.from_numpy(data[key]).float()
+            # Ensure 'dt' is a float, not a 0-dim tensor
+            if 'dt' in jd:
+                jd['dt'] = float(jd['dt'].item())
+        else:
+            # Fallback to original JSON loading
+            print(f"Loading eval data from JSON: {args.test_json}")
+            jd = load_json_data(args.test_json)
 
         # Try to get z0 from test JSON. If we detect a 3D X as traj_true, we'll reset z0 below.
         z0 = _try_get_tensor(jd, "z0", args.device, torch.float32)
@@ -838,8 +986,8 @@ def main():
                     plt.savefig(os.path.join(outdir, "learned_masses.png"), dpi=150); plt.close()
                     print("Learned masses:", np.round(m, 4))
 
-            traj_rk4 = rollout(rk4_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
-            traj_lf  = rollout(leapfrog_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
+            traj_rk4 = rollout(rk4_step, model.time_derivatives, z0, steps=args.rollout_steps, dt=args.dt)
+            traj_lf  = rollout(leapfrog_step, model.time_derivatives, z0, steps=args.rollout_steps, dt=args.dt)
 
             Ht_rk4 = torch.stack([
                 model.hamiltonian(traj_rk4[t]).detach()
@@ -962,8 +1110,8 @@ def main():
                 plt.savefig(os.path.join(outdir, "learned_masses.png"), dpi=150); plt.close()
                 print("Learned masses:", np.round(m, 4))
 
-        traj_rk4 = rollout(rk4_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
-        traj_lf  = rollout(leapfrog_step, model.time_derivatives, z0, steps=steps, dt=args.dt)
+        traj_rk4 = rollout(rk4_step, model.time_derivatives, z0, steps=args.rollout_steps, dt=args.dt)
+        traj_lf  = rollout(leapfrog_step, model.time_derivatives, z0, steps=args.rollout_steps, dt=args.dt)
 
         Ht_rk4 = torch.stack([
             model.hamiltonian(traj_rk4[t]).detach()
