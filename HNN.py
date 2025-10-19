@@ -206,7 +206,7 @@ class HNN(nn.Module):
             if self.constraint_fn is not None:
                 dqdt, dpdt = self._apply_constraints(z, dqdt, dpdt)
 
-            # No manual COM/momentum patch here — conservation should emerge from symmetry
+            # No manual COM/momentum patch here; conservation should emerge from symmetry
             return torch.cat([dqdt, dpdt], dim=1)
         
     def _minv_vec(self, device=None, dtype=None):
@@ -229,7 +229,7 @@ class HNN(nn.Module):
                 m_per_dof = self.log_m_dof.exp().to(device=device, dtype=dtype)            # [3N]
                 return (1.0 / (m_per_dof + 1e-8))
 
-        # Tie mass across x,y,z for each body → repeat 3 times
+        # Tie mass across x,y,z for each body -> repeat 3 times
         m_per_dof = m_per_body.repeat_interleave(3)                                         # [3N]
         return (1.0 / (m_per_dof + 1e-8))
 
@@ -267,7 +267,7 @@ class HNN(nn.Module):
         # (J * Minv) applies Minv along the last dim of J
         A = torch.bmm(Jq * Minv.unsqueeze(1), Jq.transpose(1, 2)) + 1e-6 * eye_k  # [B,k,k]
 
-        # --- 1) Velocity projection (remove normal component) ---
+        # Velocity projection (remove normal component)
         # rhs_v = J M^{-1} v  where v = dqdt
         rhs_v = torch.bmm(Jq * Minv.unsqueeze(1), dqdt.unsqueeze(-1)).squeeze(-1)  # [B,k]
         try:
@@ -279,7 +279,7 @@ class HNN(nn.Module):
         # dqdt ← dqdt - M^{-1} J^T λ_v
         dqdt = dqdt - (Jq.transpose(1, 2) @ lam_v.unsqueeze(-1)).squeeze(-1) * Minv  # [B, ndof]
 
-        # --- 2) Force correction for dpdt (constraint impulses) ---
+        # Force correction for dpdt (constraint impulses)
         # rhs_f = J M^{-1} a  where a = dpdt (since ṗ = ∂H/∂q + J^T λ, here we just correct)
         rhs_f = torch.bmm(Jq * Minv.unsqueeze(1), dpdt.unsqueeze(-1)).squeeze(-1)  # [B,k]
         try:
@@ -338,7 +338,7 @@ def train_epoch_vfield(model: HNN, loader: DataLoader, device: str,
         # Accumulate loss, weighted by batch size
         total += loss.item() * xb.size(0) 
         
-    # Return average loss over the *entire* dataset
+    # Return average loss over the entire dataset
     return total / len(loader.dataset)
 
 def train_epoch_rollout(model: HNN, loader: DataLoader, dt: float, device: str,
@@ -362,7 +362,7 @@ def train_epoch_rollout(model: HNN, loader: DataLoader, dt: float, device: str,
         # Accumulate loss, weighted by batch size
         total += loss.item() * zb.size(0)
         
-    # Return average loss over the *entire* dataset
+    # Return average loss over the entire dataset
     return total / len(loader.dataset)
 
 def train_epoch_rolloutK(model: HNN, z_t: torch.Tensor, z_targets: torch.Tensor, dt: float, K: int = 4, batch_size: int = 256, lr: float = 1e-3) -> float:
@@ -521,14 +521,14 @@ def main():
 
     seed_all(args.seed)
 
-    # --- Define file paths ---
+    # Define file paths
     train_data_path = "HNN_train.npz"  # <-- Prioritize .npz
     test_data_path = "HNN_test.npz"    # <-- Prioritize .npz
     
     # Load training data
     z = dz = z_next = None  # initialize so they're always defined
 
-    # --- Load from NPZ first ---
+    # Load from NPZ first
     if os.path.exists(train_data_path):
         print(f"Loading from {train_data_path}")
         data = np.load(train_data_path)
@@ -539,7 +539,7 @@ def main():
         args.mode = "rollout" # We know .npz data is for rollout
         print(f"Loaded training NPZ. z: {z.shape}, z_next: {z_next.shape}, dt: {args.dt}")
 
-    # --- Fallback to JSON ---
+    # Fallback to JSON
     elif args.train_json and os.path.exists(args.train_json):
         jd = load_json_data(args.train_json)
         if 'dt' in jd:
@@ -558,13 +558,13 @@ def main():
             print("Detected next-state labels in training JSON -> switching to rollout training.")
             args.mode = "rollout"
             
-    # --- Fallback to NPY ---
+    # Fallback to NPY
     else:
         if args.train_z is None:
             raise SystemExit("--train-z is required when no train JSON is provided")
         z = load_npy(args.train_z)
         print(f"Loaded z: {tuple(z.shape)} from {args.train_z}")
-        # (You would also load dz or z_next from .npy here if using that format)
+        # (One would also load dz or z_next from .npy here if using that format)
 
     N, D = z.shape
     # Auto-detect n_bodies
@@ -654,7 +654,7 @@ def main():
     train_rmse_hist, val_rmse_hist = [], []
     epochs = args.epochs
 
-    # Training Loop ---
+    # Training Loop
     for ep in range(1, epochs + 1):
         if args.mode == "rollout":
             # <-- Pass the loader and device, not the giant tensors
@@ -673,7 +673,7 @@ def main():
             # loss is now the epoch's avg MSE, so just sqrt it
             rmse_train = np.sqrt(loss)
 
-        # Efficient Validation Loop ---
+        # Efficient Validation Loop
         rmse_val = None
         if val_loader is not None: # <-- Check if we created a val_loader
             model.eval()           # <-- Set model to evaluation mode
@@ -1065,7 +1065,7 @@ def main():
             traj_true = torch.as_tensor(traj_true_raw, device=traj.device, dtype=traj.dtype)
 
             # Accept [T, D] or [T, B, D]. If it's 2-D, treat as single-trajectory batch.
-            if traj_true.ndim == 2:           # [T, D] → [T, 1, D]
+            if traj_true.ndim == 2:           # [T, D] -> [T, 1, D]
                 traj_true = traj_true.unsqueeze(1)
             elif traj_true.ndim != 3:
                 raise SystemExit(f"Expected traj_true with ndim 2 or 3, got {traj_true.ndim}")
@@ -1084,7 +1084,7 @@ def main():
             q_pred = traj_pred_cmp[..., :ndof].reshape(T_cmp, -1, args.n_bodies, 3).cpu().numpy()
             q_true = traj_true_cmp[..., :ndof].reshape(T_cmp, -1, args.n_bodies, 3).cpu().numpy()
 
-            bidx = 0  # or use args.plot_batch_index if you added it
+            bidx = 0  # or use args.plot_batch_index if needed
             for b in range(args.n_bodies):
                 diff = q_pred[:, bidx, b] - q_true[:, bidx, b]  # [T_cmp, 3]
                 rmse_t = np.sqrt((diff**2).mean(axis=1))
