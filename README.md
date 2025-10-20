@@ -257,3 +257,29 @@ python HNN.py
 ```
 
 ---
+
+## Acknowledgments and References
+
+This project and its implementation were inspired and guided by several foundational papers and open-source repositories on Hamiltonian Neural Networks.
+
+### Foundational Papers
+
+* **Hamiltonian Neural Networks**
+    * Greydanus, Samuel, Misko Dzamba, and Jason Yosinski.
+    * *Advances in neural information processing systems 32* (2019).
+
+* **Hamiltonian neural networks for solving equations of motion**
+    * Mattheakis, Marios, David Sondak, Akshunna S. Dogra, and Pavlos Protopapas.
+    * *Physical Review E 105.6* (2022): 065305.
+
+* **Simplifying hamiltonian and lagrangian neural networks via explicit constraints**
+    * Finzi, Marc, Ke Alexander Wang, and Andrew G. Wilson.
+    * *Advances in neural information processing systems 33* (2020): 13880-13889.
+
+### Code References
+
+* **HNN:** [github.com/greydanus/hamiltonian-nn](https://github.com/greydanus/hamiltonian-nn)
+* **HNN for Solving Equations of Motion:** [github.com/mariosmat/hamiltonianNNetODEs](https://github.com/mariosmat/hamiltonianNNetODEs)
+* **Constrained HNN:** [github.com/mfinzi/constrained-hamiltonian-neural-networks](https://github.com/mfinzi/constrained-hamiltonian-neural-networks)
+
+---
