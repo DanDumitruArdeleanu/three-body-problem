@@ -212,7 +212,7 @@ def main():
     X_train_hnn = reformat_batch_for_hnn(X_train, m_gen, D_gen, n_b_gen)
     y_train_hnn = reformat_batch_for_hnn(y_train, m_gen, D_gen, n_b_gen)
 
-    # --- Save as efficient .npz ---
+    # Save as efficient .npz
     print("Saving training data to HNN_train.npz")
     np.savez(
         os.path.join(os.getcwd(), "HNN_train.npz"),
@@ -220,7 +220,6 @@ def main():
         y=y_train_hnn,
         dt=np.array(train_generator.timestep) # Save dt as a 0-dim array
     )
-    # --- END ---
 
     X_test, y_test = test_data
     
@@ -236,7 +235,6 @@ def main():
         y=y_test_hnn,
         dt=np.array(test_generator.timestep)
     )
-    # --- END ---
         
     plt.plot(y_train[:1000])
     plt.show()

@@ -49,8 +49,8 @@ def load_json_data(path: str):
     # Accept aliases X->z, Y->dz, y->z_next
     if 'z' in data or 'X' in data:
         out['z'] = _to_tensor(data.get('z', data.get('X')))
-    if 'X' in data:                                # <-- add this
-        out['X'] = _to_tensor(data['X'])           # <-- add this
+    if 'X' in data:
+        out['X'] = _to_tensor(data['X'])
     if 'dz' in data or 'Y' in data:
         out['dz'] = _to_tensor(data.get('dz', data.get('Y')))
     if 'z_next' in data or 'y' in data:
@@ -95,7 +95,7 @@ class HNN(nn.Module):
         self.separable = separable
         self.learn_mass = learn_mass
         self.tie_body_mass = tie_body_mass
-        self.depth = depth  # <-- make sure this exists if you reference it
+        self.depth = depth
 
         # Normalization buffers
         self.register_buffer("z_mean", torch.zeros(2 * self.ndof))
@@ -106,7 +106,7 @@ class HNN(nn.Module):
             pair_idx = torch.triu_indices(n_bodies, n_bodies, 1)
             self.register_buffer("pair_idx", pair_idx)  # [2, n_pairs]
 
-            # shared per-pair MLP φ: R -> R, applied per pair then summed
+            # shared per-pair MLP phi: R -> R, applied per pair then summed
             self.phi_pair = build_mlp(
                 in_dim=1, out_dim=1,
                 hidden=max(16, hidden // 2),
@@ -161,6 +161,8 @@ class HNN(nn.Module):
 
         # Choose one input to phi:  1/d  (simple & works well)
         s = (1.0 / d).unsqueeze(-1)                         # [B, n_pairs, 1]
+
+        # if you wanna add relativistic effects, uncomment the following part
 
         # if not self.learn_mass:
         #     m = self.m_body_fixed                          # [N]
@@ -225,7 +227,7 @@ class HNN(nn.Module):
             if hasattr(self, "log_m_body"):
                 m_per_body = self.log_m_body.exp().to(device=device, dtype=dtype)          # [N]
             else:
-                # Untied per-dof (see Fix #3); shape [3N]
+                # Untied per-dof; shape [3N]
                 m_per_dof = self.log_m_dof.exp().to(device=device, dtype=dtype)            # [3N]
                 return (1.0 / (m_per_dof + 1e-8))
 
@@ -249,7 +251,7 @@ class HNN(nn.Module):
             g = g.unsqueeze(1)
         k = g.size(1)
 
-        # Build J_q = ∂g/∂q : [B, k, ndof]
+        # Build J_q = del g/del q : [B, k, ndof]
         rows = []
         for i in range(k):
             gi = g[:, i].sum()
@@ -267,7 +269,7 @@ class HNN(nn.Module):
         # (J * Minv) applies Minv along the last dim of J
         A = torch.bmm(Jq * Minv.unsqueeze(1), Jq.transpose(1, 2)) + 1e-6 * eye_k  # [B,k,k]
 
-        # Velocity projection (remove normal component)
+        # Velocity projection
         # rhs_v = J M^{-1} v  where v = dqdt
         rhs_v = torch.bmm(Jq * Minv.unsqueeze(1), dqdt.unsqueeze(-1)).squeeze(-1)  # [B,k]
         try:
@@ -276,18 +278,18 @@ class HNN(nn.Module):
         except RuntimeError:
             lam_v = torch.linalg.solve(A, rhs_v)
 
-        # dqdt ← dqdt - M^{-1} J^T λ_v
+        # dqdt <- dqdt - M^{-1} J^T λ_v
         dqdt = dqdt - (Jq.transpose(1, 2) @ lam_v.unsqueeze(-1)).squeeze(-1) * Minv  # [B, ndof]
 
-        # Force correction for dpdt (constraint impulses)
-        # rhs_f = J M^{-1} a  where a = dpdt (since ṗ = ∂H/∂q + J^T λ, here we just correct)
+        # Force correction for dpdt
+        # rhs_f = J M^{-1} a  where a = dpdt (since p dot = del H/del q + J^T lambda, here we just correct)
         rhs_f = torch.bmm(Jq * Minv.unsqueeze(1), dpdt.unsqueeze(-1)).squeeze(-1)  # [B,k]
         try:
             lam_f = torch.cholesky_solve(rhs_f.unsqueeze(-1), L).squeeze(-1)
         except RuntimeError:
             lam_f = torch.linalg.solve(A, rhs_f)
 
-        # dpdt ← dpdt - M^{-1} J^T λ_f
+        # dpdt <- dpdt - M^{-1} J^T lambda_f
         dpdt = dpdt - (Jq.transpose(1, 2) @ lam_f.unsqueeze(-1)).squeeze(-1) * Minv  # [B, ndof]
 
         return dqdt, dpdt
@@ -316,7 +318,7 @@ def rollout(fstep, f, z0: torch.Tensor, steps: int, dt: float) -> torch.Tensor:
         traj[t] = z
     return traj
 
-# Training losses (paper-consistent)
+# Training losses
 def train_epoch_vfield(model: HNN, loader: DataLoader, device: str, 
                        batch_size: int = 1024, lr: float = 1e-3) -> float:
     # Vector-field supervision (Greydanus): minimize ||f_theta(z) - \dot{z}||^2.
@@ -327,7 +329,7 @@ def train_epoch_vfield(model: HNN, loader: DataLoader, device: str,
     
     # Loop over the DataLoader
     for xb, yb in loader:
-        # <-- Move batch to device inside the loop
+        # Move batch to device inside the loop
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
 
@@ -351,7 +353,7 @@ def train_epoch_rollout(model: HNN, loader: DataLoader, dt: float, device: str,
     
     # Loop over the DataLoader
     for zb, zb_next in loader:
-        # <-- Move batch to device inside the loop
+        # Move batch to device inside the loop
         zb = zb.to(device, non_blocking=True)
         zb_next = zb_next.to(device, non_blocking=True)
 
@@ -443,7 +445,6 @@ def constrain_pair_distance(i: int, j: int, dist: float) -> Callable[[torch.Tens
 
 def _append_csv(path, **kw):
     Path(os.path.dirname(path) or ".").mkdir(parents=True, exist_ok=True)
-    import csv
     new = not os.path.exists(path)
     with open(path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(kw.keys()))
@@ -522,8 +523,8 @@ def main():
     seed_all(args.seed)
 
     # Define file paths
-    train_data_path = "HNN_train.npz"  # <-- Prioritize .npz
-    test_data_path = "HNN_test.npz"    # <-- Prioritize .npz
+    train_data_path = "HNN_train.npz"  # Prioritize .npz
+    test_data_path = "HNN_test.npz"    # Prioritize .npz
     
     # Load training data
     z = dz = z_next = None  # initialize so they're always defined
@@ -533,8 +534,8 @@ def main():
         print(f"Loading from {train_data_path}")
         data = np.load(train_data_path)
         # Load as CPU tensors. Batches will be moved to device in the loop.
-        z = torch.from_numpy(data['X']).float()        # <-- Stays on CPU
-        z_next = torch.from_numpy(data['y']).float()   # <-- Stays on CPU
+        z = torch.from_numpy(data['X']).float()        # Stays on CPU
+        z_next = torch.from_numpy(data['y']).float()   # Stays on CPU
         args.dt = float(data['dt'])
         args.mode = "rollout" # We know .npz data is for rollout
         print(f"Loaded training NPZ. z: {z.shape}, z_next: {z_next.shape}, dt: {args.dt}")
@@ -575,7 +576,7 @@ def main():
         print(f"Auto-detected n_bodies = {args.n_bodies}")
     assert D == 2*3*args.n_bodies, "z dimensionality must match n_bodies"
 
-    # --- Create Train DataLoader ---
+    # Create Train DataLoader
     if args.mode == "rollout":
         if z_next is None:
             raise SystemExit("Mode 'rollout' requires 'y' or 'z_next' data.")
@@ -588,14 +589,14 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch,
-        shuffle=True,                                       # <-- Automatically shuffles data each epoch
-        num_workers = 0 if os.name == "nt" else 4,          # <-- Tune this (e.g., 0, 2, 4)
-        pin_memory=True,                                    # <-- Speeds up CPU-to-GPU transfer
-        drop_last=True                                      # <-- Avoids tiny final batches
+        shuffle=True,                                       # Automatically shuffles data each epoch
+        num_workers = 0 if os.name == "nt" else 4,          # Tune this (e.g., 0, 2, 4)
+        pin_memory=True,                                    # Speeds up CPU-to-GPU transfer
+        drop_last=True                                      # Avoids tiny final batches
     )
     print(f"Created Train DataLoader with {len(train_loader)} batches.")
 
-    # Create Val DataLoader (once, before the loop) ---
+    # Create Val DataLoader (once, before the loop)
     val_loader = None
     if os.path.exists(test_data_path):
         print(f"Loading validation data from {test_data_path}")
@@ -639,10 +640,10 @@ def main():
     ).to(args.device)
 
     # Normalization from training states
-    mean, std = fit_norm(z) # <-- This is fine, z is still on CPU
+    mean, std = fit_norm(z) # This is fine, z is still on CPU
     apply_norm(model, mean.to(args.device), std.to(args.device))
 
-    # Load checkpoint (optional)
+    # Load checkpoint
     if args.load is not None and os.path.exists(args.load):
         print(f"Loading checkpoint: {args.load}")
         load_checkpoint(args.load, model, map_location=args.device)
@@ -657,7 +658,7 @@ def main():
     # Training Loop
     for ep in range(1, epochs + 1):
         if args.mode == "rollout":
-            # <-- Pass the loader and device, not the giant tensors
+            # Pass the loader and device, not the giant tensors
             loss = train_epoch_rollout(
                 model, train_loader, args.dt, args.device,
                 batch_size=args.batch, lr=args.lr,
@@ -675,15 +676,15 @@ def main():
 
         # Efficient Validation Loop
         rmse_val = None
-        if val_loader is not None: # <-- Check if we created a val_loader
-            model.eval()           # <-- Set model to evaluation mode
+        if val_loader is not None: # Check if we created a val_loader
+            model.eval()           # Set model to evaluation mode
             val_loss_total = 0.0
-            step_fn = rk4_step if args.integrator == "rk4" else leapfrog_step # <-- Define step_fn here
+            step_fn = rk4_step if args.integrator == "rk4" else leapfrog_step # Define step_fn here
 
             with torch.no_grad():
                 # Loop over validation batches
                 for z_val_b, z_next_val_b in val_loader:
-                    # <-- Move validation batches to device
+                    # Move validation batches to device
                     z_val_b = z_val_b.to(args.device, non_blocking=True)
                     z_next_val_b = z_next_val_b.to(args.device, non_blocking=True)
                     
@@ -694,7 +695,7 @@ def main():
             
             # Calculate average RMSE over the entire validation dataset
             rmse_val = np.sqrt(val_loss_total / len(val_loader.dataset))
-            model.train() # <-- Set model back to train mode
+            model.train() # Set model back to train mode
 
         train_rmse_hist.append(rmse_train)
         val_rmse_hist.append(rmse_val if rmse_val is not None else float('nan'))
@@ -710,10 +711,10 @@ def main():
 
     # Plot RMSE vs Epoch
     plt.figure(figsize=(6,4))
-    plt.plot(range(1, epochs+1), train_rmse_hist, label="Train RMSE")
+    plt.plot(range(1, epochs+1), train_rmse_hist, label="Training RMSE")
     if any(not np.isnan(v) for v in val_rmse_hist):
-        plt.plot(range(1, epochs+1), val_rmse_hist, label="Val RMSE")
-    plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("RMSE vs Epochs")
+        plt.plot(range(1, epochs+1), val_rmse_hist, label="Validation RMSE")
+    plt.xlabel("Epoch"); plt.ylabel("RMSE"); plt.title("RMSE vs. Epochs")
     plt.grid(alpha=0.3); plt.legend(frameon=False); plt.tight_layout()
     plt.savefig("plots/rmse_epochs.png", dpi=150); plt.close()
     print("Saved training curves to plots/rmse_epochs.png")
@@ -750,10 +751,10 @@ def main():
         t = np.arange(len(mean))
 
         plt.figure(figsize=(7, 4))
-        plt.plot(t, mean, label="mean rel. energy error")
-        plt.fill_between(t, np.maximum(0.0, mean-std), mean+std, alpha=0.2, label="±1 std")
-        plt.xlabel("step"); plt.ylabel("relative energy error")
-        plt.title("Energy drift over time")
+        plt.plot(t, mean, label="Mean Relative Energy Error")
+        plt.fill_between(t, np.maximum(0.0, mean-std), mean+std, alpha=0.2, label="±1 Standard Deviations")
+        plt.xlabel("Time (step)"); plt.ylabel("Energy (relative energy error)")
+        plt.title("Energy Drift vs. Time")
         plt.yscale("log")  # usually spans many orders of magnitude
         plt.legend(frameon=False)
         plt.tight_layout()
@@ -800,10 +801,10 @@ def main():
 
         # Align lengths
         T_cmp = min(traj_pred.shape[0], traj_true.shape[0])
-        traj_pred_cmp = traj_pred[:T_cmp].detach()  # <--- add .detach()
+        traj_pred_cmp = traj_pred[:T_cmp].detach()
         traj_true_cmp = traj_true[:T_cmp]
         if torch.is_tensor(traj_true_cmp) and traj_true_cmp.requires_grad:
-            traj_true_cmp = traj_true_cmp.detach()  # <--- optional, for safety
+            traj_true_cmp = traj_true_cmp.detach()  # optional, for safety
 
         # Extract positions as [T,B,n_bodies,3]
         def _to_q(t):  # [T,B,D] with D = 6*n_bodies, q then p
@@ -834,8 +835,8 @@ def main():
                 plt.plot(t, q_pred[:, bidx, b, d_idx], '--', alpha=0.9, 
                          label=f'pred b{b} ({d_label})')
             
-            plt.title(f"Body {b} — True vs Predicted (Position vs. Time)")
-            plt.xlabel("Time Step")
+            plt.title(f"Body {b} — True vs. Predicted Trajectories (Position vs. Time)")
+            plt.xlabel("Time (step)")
             plt.ylabel("Position")
             plt.grid(True, alpha=0.3)
             plt.legend(frameon=False, ncol=3) # Arrange legend in 3 columns
@@ -850,8 +851,8 @@ def main():
         rmse_t = np.sqrt((err**2).mean(axis=(1, 2)))
         plt.figure(figsize=(7, 4))
         plt.plot(rmse_t)
-        plt.xlabel("time step"); plt.ylabel("RMSE")
-        plt.title(f"Trajectory RMSE over time (first {T_cmp} steps)")
+        plt.xlabel("Time (step)"); plt.ylabel("RMSE")
+        plt.title(f"Trajectory RMSE vs. Time")
         plt.tight_layout()
         plt.savefig(os.path.join(outdir, "true_vs_pred_rmse_t.png"), dpi=150)
         plt.close()
@@ -924,7 +925,7 @@ def main():
             # Energy vs time
             plt.figure(figsize=(7,4))
             plt.plot(Ht_mean, label="⟨H⟩")
-            plt.xlabel("step"); plt.ylabel("Energy"); plt.title("Energy vs Time")
+            plt.xlabel("Time (step)"); plt.ylabel("Energy"); plt.title("Energy vs. Time")
             plt.grid(alpha=0.3); plt.legend(frameon=False)
             plt.tight_layout(); plt.savefig(os.path.join(outdir, "energy_time.png"), dpi=150); plt.close()
 
@@ -932,7 +933,7 @@ def main():
             plt.figure(figsize=(7,4))
             for i, comp in enumerate(["x", "y", "z"]):
                 plt.plot(P_mean[:, i], label=f"P_{comp}")
-            plt.xlabel("step"); plt.ylabel("Momentum"); plt.title("Linear Momentum vs Time")
+            plt.xlabel("Time (step)"); plt.ylabel("Momentum"); plt.title("Linear Momentum vs. Time")
             plt.grid(alpha=0.3); plt.legend(frameon=False)
             plt.tight_layout(); plt.savefig(os.path.join(outdir, "linear_momentum_time.png"), dpi=150); plt.close()
 
@@ -940,7 +941,7 @@ def main():
             plt.figure(figsize=(7,4))
             for i, comp in enumerate(["x", "y", "z"]):
                 plt.plot(L_mean[:, i], label=f"L_{comp}")
-            plt.xlabel("step"); plt.ylabel("Angular Momentum"); plt.title("Angular Momentum vs Time")
+            plt.xlabel("Time (step)"); plt.ylabel("Angular Momentum"); plt.title("Angular Momentum vs. Time")
             plt.grid(alpha=0.3); plt.legend(frameon=False)
             plt.tight_layout(); plt.savefig(os.path.join(outdir, "angular_momentum_time.png"), dpi=150); plt.close()
 
@@ -969,8 +970,8 @@ def main():
                     rmse_t = np.sqrt((diff**2).mean(axis=1))
                     plt.figure(figsize=(6,4))
                     plt.plot(rmse_t)
-                    plt.xlabel("step"); plt.ylabel(f"RMSE body {b}")
-                    plt.title(f"Body {b} RMSE over time")
+                    plt.xlabel("Time (step)"); plt.ylabel(f"RMSE - Body {b}")
+                    plt.title(f"RMSE vs. Time - Body {b}")
                     plt.tight_layout()
                     plt.savefig(os.path.join(outdir, f"rmse_time_body{b}.png"), dpi=150)
                     plt.close()
@@ -981,7 +982,7 @@ def main():
                     plt.figure(figsize=(5,3))
                     plt.bar(range(len(m)), m)
                     plt.title("Learned Mass per Body")
-                    plt.xlabel("Body index"); plt.ylabel("Mass")
+                    plt.xlabel("Body"); plt.ylabel("Mass")
                     plt.tight_layout()
                     plt.savefig(os.path.join(outdir, "learned_masses.png"), dpi=150); plt.close()
                     print("Learned masses:", np.round(m, 4))
@@ -1002,8 +1003,8 @@ def main():
             plt.figure(figsize=(7,4))
             plt.plot(Ht_rk4, label="RK4")
             plt.plot(Ht_lf, label="Leapfrog")
-            plt.xlabel("step"); plt.ylabel("Energy")
-            plt.title("Energy Stability: RK4 vs Leapfrog")
+            plt.xlabel("Time (step)"); plt.ylabel("Energy")
+            plt.title("Energy Stability - RK4 vs. Leapfrog")
             plt.legend(frameon=False)
             plt.tight_layout(); plt.savefig(os.path.join(outdir, "energy_rk4_vs_leapfrog.png"), dpi=150); plt.close()
 
@@ -1039,7 +1040,7 @@ def main():
         # Energy vs time
         plt.figure(figsize=(7,4))
         plt.plot(Ht_mean, label="⟨H⟩")
-        plt.xlabel("step"); plt.ylabel("Energy"); plt.title("Energy vs Time")
+        plt.xlabel("Time (step)"); plt.ylabel("Energy"); plt.title("Energy vs. Time")
         plt.grid(alpha=0.3); plt.legend(frameon=False)
         plt.tight_layout(); plt.savefig(os.path.join(outdir, "energy_time.png"), dpi=150); plt.close()
 
@@ -1047,7 +1048,7 @@ def main():
         plt.figure(figsize=(7,4))
         for i, comp in enumerate(["x", "y", "z"]):
             plt.plot(P_mean[:, i], label=f"P_{comp}")
-        plt.xlabel("step"); plt.ylabel("Momentum"); plt.title("Linear Momentum vs Time")
+        plt.xlabel("Time (step)"); plt.ylabel("Momentum"); plt.title("Linear Momentum vs. Time")
         plt.grid(alpha=0.3); plt.legend(frameon=False)
         plt.tight_layout(); plt.savefig(os.path.join(outdir, "linear_momentum_time.png"), dpi=150); plt.close()
 
@@ -1055,7 +1056,7 @@ def main():
         plt.figure(figsize=(7,4))
         for i, comp in enumerate(["x", "y", "z"]):
             plt.plot(L_mean[:, i], label=f"L_{comp}")
-        plt.xlabel("step"); plt.ylabel("Angular Momentum"); plt.title("Angular Momentum vs Time")
+        plt.xlabel("Time (step)"); plt.ylabel("Angular Momentum"); plt.title("Angular Momentum vs. Time")
         plt.grid(alpha=0.3); plt.legend(frameon=False)
         plt.tight_layout(); plt.savefig(os.path.join(outdir, "angular_momentum_time.png"), dpi=150); plt.close()
 
@@ -1086,12 +1087,12 @@ def main():
 
             bidx = 0  # or use args.plot_batch_index if needed
             for b in range(args.n_bodies):
-                diff = q_pred[:, bidx, b] - q_true[:, bidx, b]  # [T_cmp, 3]
+                diff = q_pred[:, bidx, b] - q_true[:, bidx, b]
                 rmse_t = np.sqrt((diff**2).mean(axis=1))
                 plt.figure(figsize=(6,4))
                 plt.plot(rmse_t)
-                plt.xlabel("step"); plt.ylabel(f"RMSE body {b}")
-                plt.title(f"Body {b} RMSE over time")
+                plt.xlabel("Time (step)"); plt.ylabel(f"RMSE - Body {b}")
+                plt.title(f"RMSE vs. Time - Body {b}")
                 plt.tight_layout()
                 plt.savefig(os.path.join(outdir, f"rmse_time_body{b}.png"), dpi=150)
                 plt.close()
@@ -1105,7 +1106,7 @@ def main():
                 plt.figure(figsize=(5,3))
                 plt.bar(range(len(m)), m)
                 plt.title("Learned Mass per Body")
-                plt.xlabel("Body index"); plt.ylabel("Mass")
+                plt.xlabel("Body"); plt.ylabel("Mass")
                 plt.tight_layout()
                 plt.savefig(os.path.join(outdir, "learned_masses.png"), dpi=150); plt.close()
                 print("Learned masses:", np.round(m, 4))
@@ -1126,8 +1127,8 @@ def main():
         plt.figure(figsize=(7,4))
         plt.plot(Ht_rk4, label="RK4")
         plt.plot(Ht_lf, label="Leapfrog")
-        plt.xlabel("step"); plt.ylabel("Energy")
-        plt.title("Energy Stability: RK4 vs Leapfrog")
+        plt.xlabel("Time (step)"); plt.ylabel("Energy")
+        plt.title("Energy Stability - RK4 vs. Leapfrog")
         plt.legend(frameon=False)
         plt.tight_layout(); plt.savefig(os.path.join(outdir, "energy_rk4_vs_leapfrog.png"), dpi=150); plt.close()
 
